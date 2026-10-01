@@ -1,0 +1,24 @@
+bake20261001  2026-10-01T09:51:15+08:00
+source: /home/weibin/projects3/DIAL02
+
+gr00t/data/dataset.py
+gr00t/data/transform/state_action.py
+gr00t/experiment/data_config_dial.py
+gr00t/model/action_head/cross_attention_dit.py
+gr00t/model/action_head/flow_matching_action_head_dial.py
+gr00t/model/backbone/vlm_backbone_dial.py
+gr00t/model/configs/gr00t_n1.5_dial_augPosRot.json
+gr00t/model/gr00t_n1_dial.py
+gr00t/model/transforms.py
+MANIFEST.txt
+README.md
+scripts/diag_sf_per_frame_and_probe.py
+scripts/dual_system_train.py
+scripts/run_24task_finetune_end2end_sf_tune_llm_test.sh
+scripts/run_24task_pretrain_golden_sf_tune_llm_20k.sh
+scripts/run_24task_sf_tune_llm_pipeline.sh
+scripts/run_mot_aligned_20k_pipeline.sh
+scripts/run_mot_vs_dense_aligned_2k.sh
+scripts/run_sf_dual_channel_2k.sh
+scripts/smoke_feed_sf_to_dit.py
+scripts/verify_state_future_fixes.py
