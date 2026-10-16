@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
@@ -42,8 +43,14 @@ from gr00t.model.backbone.vlm_backbone_dial import DEFAULT_VLM_PATH
 import sys
 import numpy as np
 
-# SF aux-head target (task-relevant Cartesian + hands). Not used by the action head.
-# 3+6 + 3+6 + 6+6 = 30 dims; skip sin-cos so hands stay 6-d each.
+# SF aux-head target (task-relevant Cartesian + hands + fingertips).
+# Not used by the action head.
+# 2026-10-11: expanded 30 -> 60 by adding 10 fingertip Cartesian positions.
+#   wrists pos+rot6d (18) + hand joints (12) + 10 tips x 3 (30) = 60.
+# Pre-change 30-d keys backed up in bake20261011_sf_d30/.
+# skip sin-cos so hands stay 6-d each.
+# Override with env SF_FORCE_KEY_DIM=30 for legacy d30 re-runs (w-sweep / MoT aligned).
+_SF_FORCE_KEY_DIM = os.environ.get("SF_FORCE_KEY_DIM", "").strip()
 DEFAULT_STATE_FUTURE_KEYS = [
     "state.wrist_r_pos",
     "state.wrist_r_rot6d",
@@ -52,6 +59,20 @@ DEFAULT_STATE_FUTURE_KEYS = [
     "state.right_hand",
     "state.left_hand",
 ]
+if _SF_FORCE_KEY_DIM != "30":
+    DEFAULT_STATE_FUTURE_KEYS = DEFAULT_STATE_FUTURE_KEYS + [
+        # ten fingertip Cartesian positions (L/R x thumb..pinky)
+        "state.thumb_r_pos",
+        "state.index_r_pos",
+        "state.middle_r_pos",
+        "state.ring_r_pos",
+        "state.pinky_r_pos",
+        "state.thumb_l_pos",
+        "state.index_l_pos",
+        "state.middle_l_pos",
+        "state.ring_l_pos",
+        "state.pinky_l_pos",
+    ]
 STATE_FUTURE_KEY_DIMS = {
     "state.wrist_r_pos": 3,
     "state.wrist_r_rot6d": 6,
@@ -59,6 +80,16 @@ STATE_FUTURE_KEY_DIMS = {
     "state.wrist_l_rot6d": 6,
     "state.right_hand": 6,
     "state.left_hand": 6,
+    "state.thumb_r_pos": 3,
+    "state.index_r_pos": 3,
+    "state.middle_r_pos": 3,
+    "state.ring_r_pos": 3,
+    "state.pinky_r_pos": 3,
+    "state.thumb_l_pos": 3,
+    "state.index_l_pos": 3,
+    "state.middle_l_pos": 3,
+    "state.ring_l_pos": 3,
+    "state.pinky_l_pos": 3,
 }
 
 
