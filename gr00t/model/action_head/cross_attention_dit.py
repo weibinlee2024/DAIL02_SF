@@ -67,6 +67,97 @@ class AdaLayerNorm(nn.Module):
         return x
 
 
+class ModalityCondCrossAttention(nn.Module):
+    """Dense-CA MoT cond experts: shared Q/out, separate K/V for vis | sf, then K‖K V‖V.
+
+    Teacher口径: keep Dense cross-attn; modality-ize condition side only.
+    When sf_num_tokens==0, all encoder tokens go through the vis expert (≈Dense).
+    """
+
+    def __init__(
+        self,
+        query_dim: int,
+        cross_attention_dim: int,
+        heads: int,
+        dim_head: int,
+        dropout: float = 0.0,
+        bias: bool = False,
+        out_bias: bool = True,
+    ):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        inner_dim = heads * dim_head
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=bias)
+        self.to_k_vis = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
+        self.to_v_vis = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
+        self.to_k_sf = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
+        self.to_v_sf = nn.Linear(cross_attention_dim, inner_dim, bias=bias)
+        self.to_out = nn.ModuleList(
+            [nn.Linear(inner_dim, query_dim, bias=out_bias), nn.Dropout(dropout)]
+        )
+        # Start identical to shared Dense K/V (sf expert = copy of vis)
+        with torch.no_grad():
+            self.to_k_sf.weight.copy_(self.to_k_vis.weight)
+            self.to_v_sf.weight.copy_(self.to_v_vis.weight)
+            if bias and self.to_k_vis.bias is not None:
+                self.to_k_sf.bias.copy_(self.to_k_vis.bias)
+                self.to_v_sf.bias.copy_(self.to_v_vis.bias)
+
+    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
+        # (B, L, H*D) -> (B, H, L, D)
+        b, l, _ = x.shape
+        x = x.view(b, l, self.heads, self.dim_head)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        sf_num_tokens: int = 0,
+    ) -> torch.Tensor:
+        if encoder_hidden_states is None:
+            raise ValueError("ModalityCondCrossAttention requires encoder_hidden_states")
+
+        n_sf = int(sf_num_tokens) if sf_num_tokens is not None else 0
+        if n_sf > 0:
+            if encoder_hidden_states.shape[1] < n_sf:
+                raise ValueError(
+                    f"Expected >= {n_sf} SF tokens at pack end, got L={encoder_hidden_states.shape[1]}"
+                )
+            vis = encoder_hidden_states[:, :-n_sf]
+            sf = encoder_hidden_states[:, -n_sf:]
+        else:
+            vis = encoder_hidden_states
+            sf = encoder_hidden_states[:, :0]
+
+        q = self._reshape_heads(self.to_q(hidden_states))
+        k_parts = [self._reshape_heads(self.to_k_vis(vis))]
+        v_parts = [self._reshape_heads(self.to_v_vis(vis))]
+        if sf.shape[1] > 0:
+            k_parts.append(self._reshape_heads(self.to_k_sf(sf)))
+            v_parts.append(self._reshape_heads(self.to_v_sf(sf)))
+        k = torch.cat(k_parts, dim=2)
+        v = torch.cat(v_parts, dim=2)
+
+        # attention_mask: match Dense DiT — passed through as-is when provided
+        attn_mask = attention_mask
+        if attn_mask is not None and attn_mask.ndim == 2:
+            # (B, S) key padding -> (B, 1, 1, S) additive mask for SDPA
+            # values are often 0/-10000 style from VL mask path
+            attn_mask = attn_mask[:, None, None, :]
+
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+        )
+        b, _, l, _ = out.shape
+        out = out.permute(0, 2, 1, 3).reshape(b, l, self.heads * self.dim_head)
+        out = self.to_out[0](out)
+        out = self.to_out[1](out)
+        return out
+
+
 class BasicTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -88,6 +179,7 @@ class BasicTransformerBlock(nn.Module):
         ff_inner_dim: Optional[int] = None,
         ff_bias: bool = True,
         attention_out_bias: bool = True,
+        use_mot_cond_experts: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -101,6 +193,7 @@ class BasicTransformerBlock(nn.Module):
         self.positional_embeddings = positional_embeddings
         self.num_positional_embeddings = num_positional_embeddings
         self.norm_type = norm_type
+        self.use_mot_cond_experts = bool(use_mot_cond_experts) and cross_attention_dim is not None
 
         if positional_embeddings and (num_positional_embeddings is None):
             raise ValueError(
@@ -121,16 +214,27 @@ class BasicTransformerBlock(nn.Module):
         else:
             self.norm1 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
 
-        self.attn1 = Attention(
-            query_dim=dim,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,
-            dropout=dropout,
-            bias=attention_bias,
-            cross_attention_dim=cross_attention_dim,
-            upcast_attention=upcast_attention,
-            out_bias=attention_out_bias,
-        )
+        if self.use_mot_cond_experts:
+            self.attn1 = ModalityCondCrossAttention(
+                query_dim=dim,
+                cross_attention_dim=cross_attention_dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                dropout=dropout,
+                bias=attention_bias,
+                out_bias=attention_out_bias,
+            )
+        else:
+            self.attn1 = Attention(
+                query_dim=dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                dropout=dropout,
+                bias=attention_bias,
+                cross_attention_dim=cross_attention_dim,
+                upcast_attention=upcast_attention,
+                out_bias=attention_out_bias,
+            )
 
         # 3. Feed-forward
         self.norm3 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
@@ -154,9 +258,10 @@ class BasicTransformerBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.LongTensor] = None,
+        sf_num_tokens: int = 0,
     ) -> torch.Tensor:
 
-        # 0. Self-Attention
+        # 0. Self-Attention / Cross-Attention
         if self.norm_type == "ada_norm":
             norm_hidden_states = self.norm1(hidden_states, temb)
         else:
@@ -165,12 +270,20 @@ class BasicTransformerBlock(nn.Module):
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
 
-        attn_output = self.attn1(
-            norm_hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            attention_mask=attention_mask,
-            # encoder_attention_mask=encoder_attention_mask,
-        )
+        if self.use_mot_cond_experts:
+            attn_output = self.attn1(
+                norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                sf_num_tokens=sf_num_tokens,
+            )
+        else:
+            attn_output = self.attn1(
+                norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                # encoder_attention_mask=encoder_attention_mask,
+            )
         if self.final_dropout:
             attn_output = self.final_dropout(attn_output)
 
@@ -212,12 +325,14 @@ class DiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
+        use_mot_cond_experts: bool = False,
     ):
         super().__init__()
 
         self.attention_head_dim = attention_head_dim
         self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
         self.gradient_checkpointing = False
+        self.use_mot_cond_experts = bool(use_mot_cond_experts)
 
         # Timestep encoder
         self.timestep_encoder = TimestepEncoder(
@@ -246,9 +361,13 @@ class DiT(ModelMixin, ConfigMixin):
                     num_positional_embeddings=self.config.max_num_positional_embeddings,
                     final_dropout=final_dropout,
                     cross_attention_dim=curr_cross_attention_dim,
+                    use_mot_cond_experts=self.use_mot_cond_experts
+                    and curr_cross_attention_dim is not None,
                 )
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)
+        if self.use_mot_cond_experts:
+            print("DiT MoT cond experts: ON (vis|sf separate K/V on CA layers)")
 
         # Output blocks
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=1e-6)
@@ -266,6 +385,7 @@ class DiT(ModelMixin, ConfigMixin):
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
+        sf_num_tokens: int = 0,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
@@ -285,6 +405,7 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    sf_num_tokens=0,
                 )
             else:
                 hidden_states = block(
@@ -294,6 +415,7 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
                     temb=temb,
+                    sf_num_tokens=sf_num_tokens if self.use_mot_cond_experts else 0,
                 )
             all_hidden_states.append(hidden_states)
 

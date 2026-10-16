@@ -179,8 +179,13 @@ class FlowmatchingActionHeadDIALConfig(PretrainedConfig):
 
     # Mixture-of-Transformers System-1 (default off → dense DiT)
     use_mot_system1: bool = field(default=False, metadata={"help": "Use MoT single-sequence System-1."})
+    # Dense-CA MoT cond experts: separate K/V for vis|sf, keep Dense cross-attn (teacher口径)
+    use_mot_cond_experts: bool = field(
+        default=False,
+        metadata={"help": "Dense CA with modality-specific K/V for vis|sf (mutually exclusive with use_mot_system1)."},
+    )
     mot_include_sf: bool = field(
-        default=True, metadata={"help": "Include proprio foresight (sf) modality in MoT."}
+        default=True, metadata={"help": "Include proprio foresight (sf) modality in MoT / cond-experts split."}
     )
     mot_sf_num_tokens: int = field(
         default=17, metadata={"help": "Number of SF condition tokens appended to backbone pack."}
@@ -206,8 +211,14 @@ class FlowmatchingActionHeadDIAL(nn.Module):
         self.input_embedding_dim = config.input_embedding_dim
 
         self.use_mot_system1 = bool(getattr(config, "use_mot_system1", False))
+        self.use_mot_cond_experts = bool(getattr(config, "use_mot_cond_experts", False))
         self.mot_include_sf = bool(getattr(config, "mot_include_sf", True))
         self.mot_sf_num_tokens = int(getattr(config, "mot_sf_num_tokens", 17))
+        if self.use_mot_system1 and self.use_mot_cond_experts:
+            raise ValueError(
+                "use_mot_system1 and use_mot_cond_experts are mutually exclusive "
+                "(full MoTDiT vs Dense-CA cond K/V experts)."
+            )
         if self.use_mot_system1:
             self.model = MoTDiT(**config.diffusion_model_cfg)
             # Pack tokens are backbone_embedding_dim (e.g. 2048); MoT inner dim = input_embedding_dim
@@ -224,9 +235,17 @@ class FlowmatchingActionHeadDIAL(nn.Module):
                 f"grad_ckpt={self.model.gradient_checkpointing}"
             )
         else:
-            self.model = DiT(**config.diffusion_model_cfg)
+            dit_cfg = dict(config.diffusion_model_cfg)
+            dit_cfg["use_mot_cond_experts"] = self.use_mot_cond_experts
+            self.model = DiT(**dit_cfg)
             self.mot_cond_proj = None
-            print("Action Head MoT System-1: OFF (dense DiT)")
+            if self.use_mot_cond_experts:
+                print(
+                    f"Action Head MoT cond experts: ON (Dense CA) "
+                    f"include_sf={self.mot_include_sf} sf_tokens={self.mot_sf_num_tokens}"
+                )
+            else:
+                print("Action Head MoT System-1: OFF (dense DiT)")
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
@@ -368,6 +387,16 @@ class FlowmatchingActionHeadDIAL(nn.Module):
             )
             backbone_output["backbone_features"] = backbone_features
         return backbone_output
+
+    def _cond_sf_num_tokens(self, vl_embs: torch.Tensor) -> int:
+        """SF length at pack end for Dense-CA cond experts; 0 → all tokens use vis expert."""
+        if not self.use_mot_cond_experts:
+            return 0
+        if not self.mot_include_sf or self.mot_sf_num_tokens <= 0:
+            return 0
+        if vl_embs.shape[1] < self.mot_sf_num_tokens:
+            return 0
+        return self.mot_sf_num_tokens
 
     def _split_vis_sf(self, vl_embs: torch.Tensor):
         """Split backbone pack into vis | sf (sf = last mot_sf_num_tokens when enabled)."""
@@ -590,6 +619,7 @@ class FlowmatchingActionHeadDIAL(nn.Module):
                 encoder_attention_mask=vl_attn_mask.float() if self.use_vl_mask else None,
                 timestep=t_discretized,
                 return_all_hidden_states=False,  # NOTE (YL): not using flare now
+                sf_num_tokens=self._cond_sf_num_tokens(vl_embs),
             )
 
 
@@ -764,6 +794,7 @@ class FlowmatchingActionHeadDIAL(nn.Module):
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embs,
                     timestep=timesteps_tensor,
+                    sf_num_tokens=self._cond_sf_num_tokens(vl_embs),
                 )
             pred = self.action_decoder(model_output, cur_embodiment_id)
             pred_velocity = pred[:, -self.action_horizon :]
