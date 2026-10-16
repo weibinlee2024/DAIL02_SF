@@ -49,7 +49,9 @@ ERROR_MSG = "Error: unexpected input/output"
 N_COLOR_CHANNELS = 3
 
 # Default SF target width: dual-arm wrist pos+rot6d + 6-DoF hands (no padding).
-DEFAULT_STATE_FUTURE_DIM = 30
+# 2026-10-11: default SF target dim 30 -> 60 (+10 fingertip pos).
+# Pre-change backup: bake20261011_sf_d30/
+DEFAULT_STATE_FUTURE_DIM = 60
 DEFAULT_STATE_FUTURE_NUM_HEADS = 8
 VALID_STATE_FUTURE_DECODERS = ("query_ca", "mean_pool")
 
@@ -212,8 +214,16 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
         # "shat": project predicted Ŝ [B,T,D_sf] → condition tokens (teacher default)
         # "mid_hidden": use query_ca pre-proj hidden (legacy 2A experiment)
         sf_dit_repr: str = "shat",
+        # Ablation: stop-grad Ŝ before state_future_to_cond so action_loss cannot reshape SF decoder
+        sf_tokens_detach: bool = False,
+        # Train-time dropout: replace SF cond tokens with learnable null (CFG-style)
+        p_sf_drop: float = 0.0,
+        # Train-time intent-swap: with this prob, roll SF tokens across batch (wrong foresight)
+        p_sf_swap: float = 0.0,
         # Mixture-of-Transformers System-1 (action head)
         use_mot_system1: bool = False,
+        # Dense-CA MoT cond experts (teacher口径); mutually exclusive with use_mot_system1
+        use_mot_cond_experts: bool = False,
         mot_include_sf: bool = True,
         mot_sf_num_tokens: int = 17,
         mot_num_layers: int = None,
@@ -230,9 +240,20 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
         config.action_head_cfg['correct_vl_mask'] = correct_vl_mask
         if matching_coeff is not None:
             config.action_head_cfg['matching_coeff'] = matching_coeff
+        if use_mot_system1 and use_mot_cond_experts:
+            raise ValueError(
+                "use_mot_system1 and use_mot_cond_experts are mutually exclusive"
+            )
         config.action_head_cfg['use_mot_system1'] = bool(use_mot_system1)
+        config.action_head_cfg['use_mot_cond_experts'] = bool(use_mot_cond_experts)
         config.action_head_cfg['mot_include_sf'] = bool(mot_include_sf)
         config.action_head_cfg['mot_sf_num_tokens'] = int(mot_sf_num_tokens)
+        if use_mot_cond_experts:
+            config.action_head_cfg.setdefault("diffusion_model_cfg", {})
+            config.action_head_cfg["diffusion_model_cfg"] = dict(
+                config.action_head_cfg["diffusion_model_cfg"]
+            )
+            config.action_head_cfg["diffusion_model_cfg"]["use_mot_cond_experts"] = True
         if use_mot_system1 and mot_num_layers is not None:
             config.action_head_cfg.setdefault("diffusion_model_cfg", {})
             config.action_head_cfg["diffusion_model_cfg"] = dict(
@@ -355,6 +376,18 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
         if repr_mode not in ("shat", "mid_hidden"):
             raise ValueError(f"sf_dit_repr={sf_dit_repr!r}; expected 'shat' or 'mid_hidden'")
         self.sf_dit_repr = repr_mode
+        self.sf_tokens_detach = bool(sf_tokens_detach)
+        self.p_sf_drop = float(p_sf_drop)
+        self.p_sf_swap = float(p_sf_swap)
+        if not (0.0 <= self.p_sf_drop <= 1.0):
+            raise ValueError(f"p_sf_drop={p_sf_drop!r}; expected in [0, 1]")
+        if not (0.0 <= self.p_sf_swap <= 1.0):
+            raise ValueError(f"p_sf_swap={p_sf_swap!r}; expected in [0, 1]")
+        # Online / eval SR ablations (deterministic). Train path still uses p_sf_drop/swap.
+        # correct | zero | swap  — see set_sf_eval_mode()
+        self.sf_eval_mode = "correct"
+        self._sf_token_bank = []  # past SF cond tokens for intent-swap at B=1
+        self._sf_token_bank_max = 64
         sf_horizon = state_future_horizon
         if sf_horizon is None:
             sf_horizon = config.action_horizon
@@ -417,6 +450,10 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                 # Type emb to distinguish proprio foresight tokens from visual bridge pack
                 self.proprio_foresight_type_emb = nn.Parameter(torch.zeros(1, 1, hidden))
                 nn.init.normal_(self.proprio_foresight_type_emb, mean=0.0, std=0.02)
+                # Learnable null SF for p_sf_drop / CFG uncond arm / ablation
+                self.null_sf_embed = nn.Parameter(torch.zeros(1, 1, hidden))
+                nn.init.normal_(self.null_sf_embed, mean=0.0, std=0.02)
+                self.null_sf_embed.requires_grad_(self.tune_state_future_projector)
                 if self.sf_dit_repr == "shat":
                     # Project raw predicted Ŝ [..., D_sf] → condition token dim
                     self.state_future_to_cond = nn.Sequential(
@@ -428,6 +465,10 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                     print(
                         f"SF→DiT cond projector: Ŝ dim={self.state_dim_for_future} → {hidden}"
                     )
+                print(
+                    f"SF cond ablations: detach={self.sf_tokens_detach} "
+                    f"p_sf_drop={self.p_sf_drop} p_sf_swap={self.p_sf_swap}"
+                )
         else:
             print("State future projector: DISABLED")
         self.register_buffer("bridge_training_steps", torch.tensor(0, dtype=torch.float32), persistent=False)
@@ -575,8 +616,13 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                         pred_state_future, sf_mid_hidden = self._predict_state_future(
                             raw_backbone_feat, batch_size, return_hidden=True
                         )
+                        sf_for_cond = (
+                            sf_mid_hidden.detach()
+                            if self.sf_tokens_detach
+                            else sf_mid_hidden
+                        )
                         proprio_foresight_tokens = (
-                            sf_mid_hidden + self.proprio_foresight_type_emb
+                            sf_for_cond + self.proprio_foresight_type_emb
                         )
                     else:
                         pred_state_future = self._predict_state_future(
@@ -587,10 +633,20 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                             and pred_state_future is not None
                         ):
                             # Teacher default: project raw Ŝ → condition tokens
+                            # Optional detach: action_loss must not reshape SF decoder
+                            sf_for_cond = (
+                                pred_state_future.detach()
+                                if self.sf_tokens_detach
+                                else pred_state_future
+                            )
                             proprio_foresight_tokens = (
-                                self.state_future_to_cond(pred_state_future)
+                                self.state_future_to_cond(sf_for_cond)
                                 + self.proprio_foresight_type_emb
                             )
+                    if proprio_foresight_tokens is not None:
+                        proprio_foresight_tokens = self._apply_sf_cond_ablations(
+                            proprio_foresight_tokens
+                        )
 
             # SF MSE before matching/CFG doubles the batch (keeps shapes aligned)
             if (
@@ -678,9 +734,14 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                 backbone_outputs['backbone_features'] = F.normalize(backbone_outputs['backbone_features'], p=2, dim=-1)
                 projected_feat_action = F.normalize(projected_feat_action, p=2, dim=-1) # synchronize normalization
 
+            goal_image_embeds = None
             if self.compute_bridge_loss or self.bridge_type == "golden":
                 if self.goal_image_type == "future":
-                    if self.use_dino_goal:
+                    has_dino_goal = "dino_goal_images" in backbone_inputs
+                    has_goal_pixels = any(
+                        k.startswith("goal_image_") for k in backbone_inputs
+                    )
+                    if self.use_dino_goal and has_dino_goal:
                         dino_goal_img = backbone_inputs['dino_goal_images'] # [Batch, 1, C, H, W]
                         B, V_goal, C, H, W = dino_goal_img.shape
                         
@@ -689,17 +750,20 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                         raw_dino_goal = self._extract_dino(goal_img_flat, downsample_to_n=self.num_bridge_tokens)
                         
                         goal_image_embeds = raw_dino_goal.view(B, V_goal * self.num_bridge_tokens, -1)
-                    else:
+                    elif (not self.use_dino_goal) and has_goal_pixels:
                         goal_image_prefix = "goal_image_"
                         goal_image_input = {
                             k.removeprefix(goal_image_prefix): v
                             for k, v in backbone_inputs.items()
                             if k.startswith(goal_image_prefix)
                         }
-                        goal_image_embeds = self.bridge_goal_model(*goal_image_input.values())
-                        goal_image_embeds = goal_image_embeds.reshape(batch_size, -1, goal_image_embeds.shape[-1])
-                        
-                    if self.bridge_loss_type == "cosine":
+                        goal_image_embeds = self._run_bridge_vision(
+                            self.bridge_goal_model, goal_image_input, batch_size
+                        )
+                    # else: online/action_mode without future GT frame → leave None
+                    # and fall back to predicted bridge below.
+
+                    if goal_image_embeds is not None and self.bridge_loss_type == "cosine":
                         goal_image_embeds = F.normalize(goal_image_embeds, p=2, dim=-1)
 
                 elif self.goal_image_type == "current":
@@ -707,7 +771,7 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                 else:
                     raise NotImplementedError
 
-            if self.compute_bridge_loss:
+            if self.compute_bridge_loss and goal_image_embeds is not None:
                 if self.bridge_loss_type == "mse":
                     bridge_loss = F.mse_loss(backbone_outputs['backbone_features'], goal_image_embeds)
                 elif self.bridge_loss_type == "cosine":
@@ -745,11 +809,15 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                             for k, v in backbone_inputs.items()
                             if k.startswith(goal_image_prefix)
                         }
-                        goal_image_embeds = self.bridge_goal_model(*goal_image_input.values())
-                        goal_image_embeds = goal_image_embeds.reshape(batch_size, -1, goal_image_embeds.shape[-1])
+                        goal_image_embeds = self._run_bridge_vision(
+                            self.bridge_goal_model, goal_image_input, batch_size
+                        )
                         
                     if self.bridge_loss_type == "cosine":
                         goal_image_embeds = F.normalize(goal_image_embeds, p=2, dim=-1)
+                elif goal_image_embeds is None:
+                    # Online sim / action_mode: no future GT → predicted visual foresight
+                    goal_image_embeds = projected_feat_action
 
                 if self.training and self.noise_tau > 0:
                     noise_sigma = self.noise_tau * torch.rand((goal_image_embeds.size(0),) + (1,) * (len(goal_image_embeds.shape) - 1), device=goal_image_embeds.device)
@@ -828,8 +896,16 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                 goal_image_embeds = torch.cat([goal_image_embeds, uncond_goal], dim=0)
                 obs_embeds = torch.cat([obs_embeds, obs_embeds], dim=0)
                 if proprio_foresight_tokens is not None:
+                    # SF-CFG: uncond arm uses learnable null SF (not a copy of cond SF)
+                    if hasattr(self, "null_sf_embed"):
+                        uncond_sf = self.null_sf_embed.to(
+                            dtype=proprio_foresight_tokens.dtype,
+                            device=proprio_foresight_tokens.device,
+                        ).expand_as(proprio_foresight_tokens)
+                    else:
+                        uncond_sf = proprio_foresight_tokens
                     proprio_foresight_tokens = torch.cat(
-                        [proprio_foresight_tokens, proprio_foresight_tokens], dim=0
+                        [proprio_foresight_tokens, uncond_sf], dim=0
                     )
 
             if self.use_image_type_embedding:
@@ -938,8 +1014,148 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
             action_head_outputs["backbone_features"] = raw_backbone_features
             return action_head_outputs
 
+    def _run_bridge_vision(self, vision_model, inputs_dict, batch_size: int):
+        """Call Qwen vision tower with processor keys mapped to (hidden_states, grid_thw)."""
+        if not inputs_dict:
+            raise ValueError("bridge vision inputs_dict is empty")
+        if "pixel_values" in inputs_dict and "image_grid_thw" in inputs_dict:
+            out = vision_model(
+                hidden_states=inputs_dict["pixel_values"],
+                grid_thw=inputs_dict["image_grid_thw"],
+            )
+        elif "hidden_states" in inputs_dict and "grid_thw" in inputs_dict:
+            out = vision_model(
+                hidden_states=inputs_dict["hidden_states"],
+                grid_thw=inputs_dict["grid_thw"],
+            )
+        else:
+            # Legacy: rely on insertion order of values()
+            out = vision_model(*inputs_dict.values())
+        return out.reshape(batch_size, -1, out.shape[-1])
+
     def _has_state_future_module(self) -> bool:
         return hasattr(self, "state_future_decoder") or hasattr(self, "state_future_projector")
+
+    def set_sf_eval_mode(self, mode: str = "correct", bank_max: int = 64) -> None:
+        """Set deterministic online-SR SF ablation mode.
+
+        Modes (eval / action_mode):
+          - correct: use predicted SF cond as-is (default)
+          - zero:    replace SF cond with learnable null_sf_embed (or zeros)
+          - swap:    replace with a past SF from the token bank (wrong foresight).
+                     At B>1 also supports batch roll. Bank empty → null fallback.
+
+        Train-time stochastic p_sf_drop / p_sf_swap are unchanged and only run
+        when self.training is True.
+        """
+        m = (mode or "correct").strip().lower()
+        aliases = {
+            "correct": "correct",
+            "none": "correct",
+            "identity": "correct",
+            "zero": "zero",
+            "null": "zero",
+            "drop": "zero",
+            "swap": "swap",
+            "shuffle": "swap",
+        }
+        if m not in aliases:
+            raise ValueError(
+                f"sf_eval_mode={mode!r}; expected one of "
+                f"{sorted(set(aliases.values()))} (aliases: {sorted(aliases)})"
+            )
+        self.sf_eval_mode = aliases[m]
+        self._sf_token_bank = []
+        self._sf_token_bank_max = max(1, int(bank_max))
+        print(
+            f"SF eval mode: {self.sf_eval_mode} "
+            f"(bank_max={self._sf_token_bank_max}; "
+            f"null_sf={'yes' if hasattr(self, 'null_sf_embed') else 'no'})"
+        )
+
+    def _null_sf_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        if hasattr(self, "null_sf_embed"):
+            return self.null_sf_embed.to(
+                dtype=tokens.dtype, device=tokens.device
+            ).expand_as(tokens)
+        return torch.zeros_like(tokens)
+
+    def _push_sf_token_bank(self, tokens: torch.Tensor) -> None:
+        """Store detached per-sample SF cond for later intent-swap."""
+        if tokens is None:
+            return
+        with torch.no_grad():
+            for i in range(tokens.shape[0]):
+                self._sf_token_bank.append(tokens[i].detach().cpu().clone())
+        overflow = len(self._sf_token_bank) - int(self._sf_token_bank_max)
+        if overflow > 0:
+            del self._sf_token_bank[:overflow]
+
+    def _sample_sf_token_bank(self, tokens: torch.Tensor) -> torch.Tensor | None:
+        """Sample wrong SF from bank; shape-matched to tokens. None if bank empty."""
+        if not self._sf_token_bank:
+            return None
+        B = tokens.shape[0]
+        out = []
+        n_bank = len(self._sf_token_bank)
+        for _ in range(B):
+            idx = int(torch.randint(0, n_bank, (1,)).item())
+            sample = self._sf_token_bank[idx].to(
+                device=tokens.device, dtype=tokens.dtype
+            )
+            if sample.shape != tokens.shape[1:]:
+                # Shape drift (e.g. horizon change) — skip this sample
+                return None
+            out.append(sample)
+        return torch.stack(out, dim=0)
+
+    def _apply_sf_eval_mode(self, proprio_foresight_tokens: torch.Tensor) -> torch.Tensor:
+        """Deterministic online-SR SF ablations (correct / zero / swap)."""
+        tokens = proprio_foresight_tokens
+        mode = getattr(self, "sf_eval_mode", "correct") or "correct"
+        if mode == "correct":
+            self._push_sf_token_bank(tokens)
+            return tokens
+        if mode == "zero":
+            # Do not push null into the bank — keep bank for optional later swap runs
+            return self._null_sf_tokens(tokens)
+        if mode == "swap":
+            B = tokens.shape[0]
+            if B > 1:
+                wrong = tokens.roll(1, dims=0)
+            else:
+                wrong = self._sample_sf_token_bank(tokens)
+                if wrong is None:
+                    wrong = self._null_sf_tokens(tokens)
+            # Push the *correct* current tokens so the bank holds real foresight
+            self._push_sf_token_bank(tokens)
+            return wrong
+        return tokens
+
+    def _apply_sf_cond_ablations(self, proprio_foresight_tokens: torch.Tensor) -> torch.Tensor:
+        """SF cond ablations: train-time stochastic drop/swap; eval-time sf_eval_mode."""
+        if proprio_foresight_tokens is None:
+            return proprio_foresight_tokens
+        tokens = proprio_foresight_tokens
+        if self.training:
+            B = tokens.shape[0]
+            if self.p_sf_drop > 0.0 and hasattr(self, "null_sf_embed"):
+                mask = torch.bernoulli(
+                    torch.full((B, 1, 1), self.p_sf_drop, device=tokens.device)
+                ).to(dtype=tokens.dtype)
+                null_feat = self.null_sf_embed.to(
+                    dtype=tokens.dtype, device=tokens.device
+                ).expand_as(tokens)
+                tokens = (1.0 - mask) * tokens + mask * null_feat
+            if self.p_sf_swap > 0.0 and B > 1:
+                mask = torch.bernoulli(
+                    torch.full((B, 1, 1), self.p_sf_swap, device=tokens.device)
+                ).to(dtype=tokens.dtype)
+                swapped = tokens.roll(1, dims=0)
+                tokens = (1.0 - mask) * tokens + mask * swapped
+            return tokens
+        # Eval / online: deterministic modes for SR (correct / zero / swap)
+        return self._apply_sf_eval_mode(tokens)
 
     def _predict_state_future(self, raw_backbone_feat, batch_size, return_hidden: bool = False):
         """Decode SF targets from raw bridge tokens. None if the aux head is off.
@@ -1096,9 +1312,25 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                 "sf_dit_repr",
                 model_config.bridge_cfg.get("sf_dit_repr", "shat"),
             )
+            sf_tokens_detach = kwargs.pop(
+                "sf_tokens_detach",
+                model_config.bridge_cfg.get("sf_tokens_detach", False),
+            )
+            p_sf_drop = kwargs.pop(
+                "p_sf_drop",
+                model_config.bridge_cfg.get("p_sf_drop", 0.0),
+            )
+            p_sf_swap = kwargs.pop(
+                "p_sf_swap",
+                model_config.bridge_cfg.get("p_sf_swap", 0.0),
+            )
             use_mot_system1 = kwargs.pop(
                 "use_mot_system1",
                 model_config.action_head_cfg.get("use_mot_system1", False),
+            )
+            use_mot_cond_experts = kwargs.pop(
+                "use_mot_cond_experts",
+                model_config.action_head_cfg.get("use_mot_cond_experts", False),
             )
             mot_include_sf = kwargs.pop(
                 "mot_include_sf",
@@ -1126,9 +1358,23 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
         print(f"Feed state future to DiT: {feed_state_future_to_dit}")
         print(f"SF DiT repr: {sf_dit_repr}")
         print(
+            f"SF cond ablations: detach={sf_tokens_detach} "
+            f"p_sf_drop={p_sf_drop} p_sf_swap={p_sf_swap}"
+        )
+        print(
             f"MoT System-1: use={use_mot_system1} include_sf={mot_include_sf} "
             f"sf_tokens={mot_sf_num_tokens} num_layers={mot_num_layers}"
         )
+        print(f"MoT cond experts (Dense CA): use={use_mot_cond_experts}")
+        if use_mot_system1 and use_mot_cond_experts:
+            raise ValueError(
+                "use_mot_system1 and use_mot_cond_experts are mutually exclusive"
+            )
+        if use_mot_cond_experts and not feed_state_future_to_dit:
+            print(
+                "WARNING: use_mot_cond_experts=True but feed_state_future_to_dit=False "
+                "— SF segment will be empty; vis expert only."
+            )
         print(f"Action head using only one obs: {action_only_one_obs}")
         print(f"Noise Tau: {noise_tau}")
         print(f"Reweight Noise: {reweight_noise}")
@@ -1199,7 +1445,11 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
             "loss_combine_mode": loss_combine_mode,
             "feed_state_future_to_dit": feed_state_future_to_dit,
             "sf_dit_repr": sf_dit_repr,
+            "sf_tokens_detach": sf_tokens_detach,
+            "p_sf_drop": p_sf_drop,
+            "p_sf_swap": p_sf_swap,
             "use_mot_system1": use_mot_system1,
+            "use_mot_cond_experts": use_mot_cond_experts,
             "mot_include_sf": mot_include_sf,
             "mot_sf_num_tokens": mot_sf_num_tokens,
             "mot_num_layers": mot_num_layers,
@@ -1327,9 +1577,21 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
         pretrained_model.config.bridge_cfg['loss_combine_mode'] = loss_combine_mode
         pretrained_model.config.bridge_cfg['feed_state_future_to_dit'] = feed_state_future_to_dit
         pretrained_model.config.bridge_cfg['sf_dit_repr'] = sf_dit_repr
+        pretrained_model.config.bridge_cfg['sf_tokens_detach'] = sf_tokens_detach
+        pretrained_model.config.bridge_cfg['p_sf_drop'] = p_sf_drop
+        pretrained_model.config.bridge_cfg['p_sf_swap'] = p_sf_swap
         pretrained_model.config.action_head_cfg['use_mot_system1'] = use_mot_system1
+        pretrained_model.config.action_head_cfg['use_mot_cond_experts'] = use_mot_cond_experts
         pretrained_model.config.action_head_cfg['mot_include_sf'] = mot_include_sf
         pretrained_model.config.action_head_cfg['mot_sf_num_tokens'] = mot_sf_num_tokens
+        if use_mot_cond_experts:
+            pretrained_model.config.action_head_cfg.setdefault("diffusion_model_cfg", {})
+            pretrained_model.config.action_head_cfg["diffusion_model_cfg"] = dict(
+                pretrained_model.config.action_head_cfg["diffusion_model_cfg"]
+            )
+            pretrained_model.config.action_head_cfg["diffusion_model_cfg"][
+                "use_mot_cond_experts"
+            ] = True
 
         # Loading diagnostics for state_future recoverability (query_ca or mean_pool)
         if loading_info is not None:
@@ -1353,6 +1615,46 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                     f"WARNING: SF module created but checkpoint is missing "
                     f"{len(sf_missing)} keys (random init for those params): {sf_missing[:5]}..."
                 )
+                # transformers (low_cpu_mem_usage) leaves missing keys uninitialized
+                # (empty device memory can contain NaN) -> explicitly re-initialize them.
+                reinit_failed = []
+                for key in sf_missing:
+                    mod_path, _, param_name = key.rpartition(".")
+                    mod = pretrained_model
+                    for part in mod_path.split("."):
+                        if part.isdigit() and isinstance(mod, (nn.Sequential, nn.ModuleList)):
+                            mod = mod[int(part)]
+                        elif hasattr(mod, part):
+                            mod = getattr(mod, part)
+                        else:
+                            mod = None
+                            break
+                    if mod is None:
+                        reinit_failed.append(key)
+                        continue
+                    with torch.no_grad():
+                        if param_name in ("weight", "bias") and hasattr(mod, "reset_parameters"):
+                            mod.reset_parameters()
+                        else:
+                            p = getattr(mod, param_name, None)
+                            if isinstance(p, torch.nn.Parameter):
+                                nn.init.normal_(p, std=0.02)
+                            else:
+                                reinit_failed.append(key)
+                print(
+                    f"[Init] Explicitly re-initialized {len(sf_missing) - len(reinit_failed)} SF params"
+                    + (f"; could not init: {reinit_failed}" if reinit_failed else "")
+                )
+
+        # Fail-fast audit: trainable params must be finite right after loading.
+        bad_params = [
+            n for n, p in pretrained_model.named_parameters()
+            if p.requires_grad and not torch.isfinite(p).all()
+        ]
+        if bad_params:
+            raise RuntimeError(
+                f"Non-finite trainable parameters after loading: {bad_params[:10]}"
+            )
             if sf_unexpected:
                 print(
                     f"WARNING: checkpoint has {len(sf_unexpected)} unused SF keys "

@@ -75,6 +75,8 @@ class DialPolicy(BasePolicy):
         guidance_scale: float = 1.0,
         async_vlm_inference: bool = False, # <-- New: whether to enable async
         vlm_update_period: int = 3,        # <-- New: VLM update frequency
+        sf_eval_mode: str = "correct",
+        sf_swap_bank_max: int = 64,
     ):
         """
         Initialize the DialPolicy.
@@ -86,6 +88,8 @@ class DialPolicy(BasePolicy):
             embodiment_tag (Union[str, EmbodimentTag]): The embodiment tag for the model.
             denoising_steps: Number of denoising steps to use for the action head.
             device (Union[int, str]): Device to run the model on.
+            sf_eval_mode: Online-SR SF ablation — correct | zero | swap.
+            sf_swap_bank_max: Ring-buffer size for swap-mode wrong foresight.
         """
         try:
             # NOTE(YL) this returns the local path to the model which is normally
@@ -128,6 +132,25 @@ class DialPolicy(BasePolicy):
         self.vlm_update_period = vlm_update_period
         self._async_step = 0
         self._cached_backbone_feat = None
+
+        # Online-SR SF ablation (correct | zero | swap). Applied in model.eval().
+        self.sf_eval_mode = (sf_eval_mode or "correct").strip().lower()
+        self.sf_swap_bank_max = int(sf_swap_bank_max)
+        if hasattr(self.model, "set_sf_eval_mode"):
+            self.model.set_sf_eval_mode(self.sf_eval_mode, bank_max=self.sf_swap_bank_max)
+        elif self.sf_eval_mode != "correct":
+            raise RuntimeError(
+                f"sf_eval_mode={self.sf_eval_mode!r} requested but model has no set_sf_eval_mode"
+            )
+
+    def set_sf_eval_mode(self, mode: str = "correct", bank_max: int | None = None) -> None:
+        """Proxy to GR00T_N1_5_DIAL.set_sf_eval_mode for online-SR arms."""
+        self.sf_eval_mode = (mode or "correct").strip().lower()
+        if bank_max is not None:
+            self.sf_swap_bank_max = int(bank_max)
+        if not hasattr(self.model, "set_sf_eval_mode"):
+            raise RuntimeError("loaded model has no set_sf_eval_mode")
+        self.model.set_sf_eval_mode(self.sf_eval_mode, bank_max=self.sf_swap_bank_max)
 
     def apply_transforms(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         """
