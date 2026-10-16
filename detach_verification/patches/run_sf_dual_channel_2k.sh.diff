@@ -1,0 +1,107 @@
+--- /home/weibin/projects3/DIAL02-upload/scripts/run_sf_dual_channel_2k.sh	2026-10-01 09:35:40.400329231 +0800
++++ /home/weibin/projects3/DIAL02/scripts/run_sf_dual_channel_2k.sh	2026-10-12 13:15:09.807322491 +0800
+@@ -1,23 +1,36 @@
+ #!/usr/bin/env bash
+ # Dual-channel foresight → DiT: 6task 2k with feed_state_future_to_dit.
+ # Usage:
+-#   SF_DUAL_W=1 bash scripts/run_sf_dual_channel_2k.sh
+ #   SF_DUAL_W=0.05 bash scripts/run_sf_dual_channel_2k.sh
++#   SF_DECODER=mean_pool SF_TOKENS_DETACH=1 bash scripts/run_sf_dual_channel_2k.sh
++#   P_SF_DROP=0.1 P_SF_SWAP=0.1 bash scripts/run_sf_dual_channel_2k.sh
+ set -u
+ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+-DATA_ROOT=${DATA_ROOT:-"/media/weibin/Data/DIAL_DATASETS/LeRobot-AugPosRot-Correct"}
++DATA_ROOT=${DATA_ROOT:-"/media/weibin/weibin02/LeRobot-AugPosRot-Correct"}
+ PYTHON=${PYTHON:-/home/weibin/anaconda3/envs/dial/bin/python}
+ W=${SF_DUAL_W:-0.05}
+ WTAG=$(echo "$W" | tr '.' 'p')
+ REPR=${SF_DIT_REPR:-shat}
+-OUT=${SF_DUAL_OUT:-"/media/weibin/weibin02/DIAL/20260922/sf_weight_debug/dual_channel_2k/${REPR}_w${WTAG}"}
+-LOG=${SF_DUAL_LOG:-"/media/weibin/weibin02/DIAL/20260922/sf_weight_debug/dual_channel_2k/${REPR}_w${WTAG}.log"}
++DECODER=${SF_DECODER:-query_ca}
++# 2026-10-11 default 60 (wrist+hands+10 fingertip pos); use SF_STATE_DIM=30 only with restored 30-d keys
++SF_STATE_DIM=${SF_STATE_DIM:-60}
++DETACH=${SF_TOKENS_DETACH:-0}
++P_DROP=${P_SF_DROP:-0}
++P_SWAP=${P_SF_SWAP:-0}
++DETACH_TAG=""; [[ "$DETACH" == "1" || "$DETACH" == "true" ]] && DETACH_TAG="_detach"
++DROP_TAG=""; [[ "$P_DROP" != "0" && "$P_DROP" != "0.0" ]] && DROP_TAG="_pdrop$(echo "$P_DROP" | tr '.' 'p')"
++SWAP_TAG=""; [[ "$P_SWAP" != "0" && "$P_SWAP" != "0.0" ]] && SWAP_TAG="_pswap$(echo "$P_SWAP" | tr '.' 'p')"
++DIM_TAG="_d${SF_STATE_DIM}"
++RUN_TAG="${DECODER}_${REPR}_w${WTAG}${DIM_TAG}${DETACH_TAG}${DROP_TAG}${SWAP_TAG}"
++OUT=${SF_DUAL_OUT:-"/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/${RUN_TAG}"}
++LOG=${SF_DUAL_LOG:-"/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/${RUN_TAG}.log"}
+ MAX_STEPS=${SF_DUAL_STEPS:-2000}
+ SAVE_STEPS=${SF_DUAL_SAVE:-2000}
+ BATCH_SIZE=${BATCH_SIZE:-2}
+ GRAD_ACCUM=${GRAD_ACCUM:-32}
+ NUM_GPUS=${NUM_GPUS:-1}
+ TRAJS=${TRAJS:-10}
++RUN_PROBE=${RUN_PROBE:-1}
+ BASE_CFG=${BASE_CFG:-"$ROOT/gr00t/model/configs/gr00t_n1.5_dial_augPosRot.json"}
+ DATA_CONFIG=${DATA_CONFIG:-fourier_gr1_arms_waist_aug_pos_rot_flip_wrist_only_gausNorm_crop}
+ mkdir -p "$OUT" "$(dirname "$LOG")"
+@@ -46,7 +59,18 @@
+ export GRADIENT_CHECKPOINTING=1
+ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ 
+-echo "=== dual-channel 2k w=$W repr=$REPR feed_to_dit=True start $(date -Is) OUT=$OUT ===" | tee -a "$LOG"
++EXTRA_SF_FLAGS=()
++if [[ "$DETACH" == "1" || "$DETACH" == "true" ]]; then
++  EXTRA_SF_FLAGS+=(--sf-tokens-detach)
++fi
++if [[ "$P_DROP" != "0" && "$P_DROP" != "0.0" ]]; then
++  EXTRA_SF_FLAGS+=(--p-sf-drop "$P_DROP")
++fi
++if [[ "$P_SWAP" != "0" && "$P_SWAP" != "0.0" ]]; then
++  EXTRA_SF_FLAGS+=(--p-sf-swap "$P_SWAP")
++fi
++
++echo "=== dual-channel 2k decoder=$DECODER w=$W repr=$REPR dim=$SF_STATE_DIM detach=$DETACH p_drop=$P_DROP p_swap=$P_SWAP feed_to_dit=True start $(date -Is) OUT=$OUT ===" | tee -a "$LOG"
+ 
+ env -u OUT -u LOG -u SAVE_STEPS -u MAX_STEPS \
+ "$PYTHON" -u scripts/dual_system_train.py \
+@@ -63,14 +87,18 @@
+   --select_layer 12 --use_image_type_embedding --ignore_lang_prefix \
+   --report_to tensorboard \
+   --use-state-future --compute-state-future-loss --state-future-loss-weight "$W" \
+-  --state-future-decoder query_ca --state-future-dim 30 \
++  --state-future-decoder "$DECODER" --state-future-dim "$SF_STATE_DIM" \
+   --loss-combine-mode additive \
+   --feed-state-future-to-dit \
+   --sf-dit-repr "$REPR" \
++  "${EXTRA_SF_FLAGS[@]}" \
+   --output_dir "$OUT" >> "$LOG" 2>&1
+ rc=$?
+-echo "TRAIN dual w=$W repr=$REPR rc=$rc $(date -Is)" | tee -a "$LOG"
++echo "TRAIN dual decoder=$DECODER w=$W repr=$REPR rc=$rc $(date -Is)" | tee -a "$LOG"
+ [[ $rc -eq 0 ]] || exit $rc
++if [[ "${DIAL_SF_DIAG:-0}" == "1" ]]; then
++  exit 0  # diagnostic does not create a new training checkpoint
++fi
+ 
+ CKPT="$OUT/checkpoint-${MAX_STEPS}"
+ EVAL_DIR="$CKPT/eval_action_goal_loss"
+@@ -91,4 +119,22 @@
+   echo "=== results.json ===" | tee -a "$LOG"
+   cat "$EVAL_DIR/results.json" | tee -a "$LOG"
+ fi
++
++if [[ "$RUN_PROBE" == "1" || "$RUN_PROBE" == "true" ]]; then
++  PROBE_DIR="$CKPT/sf_probe_r2"
++  mkdir -p "$PROBE_DIR"
++  echo "=== probe R² decoder=$DECODER $(date -Is) ===" | tee -a "$LOG"
++  PYTHONBREAKPOINT=0 "$PYTHON" -u scripts/diag_sf_per_frame_and_probe.py \
++    --model-path "$CKPT" \
++    --data-root "$DATA_ROOT" \
++    --data-config "$DATA_CONFIG" \
++    --out-dir "$PROBE_DIR" >> "$LOG" 2>&1
++  prc=$?
++  echo "PROBE dual decoder=$DECODER rc=$prc $(date -Is)" | tee -a "$LOG"
++  if [[ -f "$PROBE_DIR/sf_per_frame_and_probe.json" ]]; then
++    echo "=== probe summary ===" | tee -a "$LOG"
++    "$PYTHON" -c "import json; d=json.load(open('$PROBE_DIR/sf_per_frame_and_probe.json')); print(json.dumps(d.get('linear_probe', d) if isinstance(d,dict) else d, indent=2)[:2000])" | tee -a "$LOG"
++  fi
++fi
++
+ exit $erc

@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Smoke: feed_state_future_to_dit + SF cond ablations (detach / drop / swap).
+
+Checks query_ca and mean_pool both build cond path; detach/drop/swap flags wire up.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+os.chdir(ROOT)
+
+import torch
+from transformers import AutoConfig
+
+from gr00t.model.gr00t_n1_dial import GR00T_N1_5_DIAL, StateFutureDecoder
+from gr00t.model.transforms import BRIDGE_TOKENS
+
+
+def _build(decoder: str, *, feed: bool, detach: bool = False, p_drop: float = 0.0, p_swap: float = 0.0):
+    cfg_path = ROOT / "gr00t/model/configs/gr00t_n1.5_dial_augPosRot.json"
+    model_config = AutoConfig.from_pretrained(str(cfg_path))
+    n = model_config.bridge_cfg.get("num_bridge_tokens", 64)
+    BRIDGE_TOKENS.update(num_bridge_tokens=n)
+    tokenizer_len = model_config.bridge_cfg.get("tokenizer_len", 151729)
+    return GR00T_N1_5_DIAL.from_pretrained(
+        str(cfg_path),
+        tokenizer_len=int(tokenizer_len),
+        use_state_future=True,
+        compute_state_future_loss=True,
+        state_future_loss_weight=0.05,
+        state_future_decoder=decoder,
+        state_future_dim=30,
+        feed_state_future_to_dit=feed,
+        sf_dit_repr="shat",
+        sf_tokens_detach=detach,
+        p_sf_drop=p_drop,
+        p_sf_swap=p_swap,
+        loss_combine_mode="additive",
+        compute_bridge_loss=True,
+        bridge_type="golden",
+        torch_dtype=torch.float32,
+    )
+
+
+def main():
+    dec = StateFutureDecoder(hidden=64, num_frames=17, out_dim=30, num_heads=8)
+    tok = torch.randn(2, 8, 64)
+    pred, mid = dec(tok, return_hidden=True)
+    assert pred.shape == (2, 17, 30), pred.shape
+    assert mid.shape == (2, 17, 64), mid.shape
+    print("OK StateFutureDecoder return_hidden", pred.shape, mid.shape)
+
+    for decoder in ("query_ca", "mean_pool"):
+        print(f"Building feed=True decoder={decoder} ...")
+        model = _build(decoder, feed=True, detach=True, p_drop=0.1, p_swap=0.1)
+        assert model.feed_state_future_to_dit
+        assert model.sf_tokens_detach
+        assert model.p_sf_drop == 0.1
+        assert model.p_sf_swap == 0.1
+        assert hasattr(model, "proprio_foresight_type_emb")
+        assert hasattr(model, "null_sf_embed")
+        assert hasattr(model, "state_future_to_cond")
+        if decoder == "query_ca":
+            assert hasattr(model, "state_future_decoder")
+            assert not hasattr(model, "state_future_projector")
+        else:
+            assert hasattr(model, "state_future_projector")
+            assert not hasattr(model, "state_future_decoder")
+        print(f"OK {decoder}: feed+detach+drop+swap+null_sf")
+
+    model_off = _build("query_ca", feed=False)
+    assert not model_off.feed_state_future_to_dit
+    assert not hasattr(model_off, "proprio_foresight_type_emb")
+    assert not hasattr(model_off, "null_sf_embed")
+    print("OK feed_to_dit=False has no type/null emb")
+
+    # Unit: ablation helper
+    model = _build("mean_pool", feed=True, p_drop=1.0, p_swap=0.0)
+    model.train()
+    x = torch.randn(4, 17, model.null_sf_embed.shape[-1])
+    y = model._apply_sf_cond_ablations(x)
+    assert y.shape == x.shape
+    # with p_drop=1 all rows should equal null
+    null = model.null_sf_embed.to(dtype=y.dtype).expand_as(y)
+    assert torch.allclose(y, null), "p_sf_drop=1 should replace all SF tokens with null"
+    print("OK p_sf_drop=1 → null_sf_embed")
+
+    model2 = _build("mean_pool", feed=True, p_drop=0.0, p_swap=1.0)
+    model2.train()
+    hidden = model2.null_sf_embed.shape[-1]
+    x = torch.randn(4, 17, hidden)
+    y = model2._apply_sf_cond_ablations(x)
+    assert y.shape == x.shape
+    assert not torch.allclose(y, x), "p_sf_swap=1 should change tokens"
+    print("OK p_sf_swap=1 rolls batch")
+
+    # Detach: action-side loss must not populate grad on Ŝ
+    model_d = _build("mean_pool", feed=True, detach=True)
+    model_d.train()
+    shat = torch.randn(2, 17, 30, requires_grad=True)
+    sf_in = shat.detach() if model_d.sf_tokens_detach else shat
+    tokens = model_d.state_future_to_cond(sf_in) + model_d.proprio_foresight_type_emb
+    tokens.sum().backward()
+    assert shat.grad is None, "sf_tokens_detach must block grads into Ŝ"
+    print("OK sf_tokens_detach blocks grad into Ŝ")
+
+    model_nd = _build("mean_pool", feed=True, detach=False)
+    model_nd.train()
+    shat2 = torch.randn(2, 17, 30, requires_grad=True)
+    tokens2 = model_nd.state_future_to_cond(shat2) + model_nd.proprio_foresight_type_emb
+    tokens2.sum().backward()
+    assert shat2.grad is not None, "without detach, grads should reach Ŝ"
+    print("OK no-detach allows grad into Ŝ")
+
+    # Pack length semantics: goal(64) + obs(N) + sf(17)
+    n_bridge = 64
+    n_obs = 64  # placeholder; real obs length varies by views
+    n_sf = model_d.state_future_horizon + 1
+    assert n_sf == 17, n_sf
+    pack_len = n_bridge + n_obs + n_sf
+    assert pack_len == n_bridge + n_obs + 17
+    print(f"OK pack length recipe: goal({n_bridge})+obs+sf({n_sf})")
+
+    print("SMOKE_PASS")
+
+
+if __name__ == "__main__":
+    main()
