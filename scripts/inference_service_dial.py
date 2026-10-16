@@ -99,6 +99,12 @@ class ArgsConfig:
         
     vlm_update_period: int = 3        # <-- New: VLM update frequency
 
+    sf_eval_mode: Literal["correct", "zero", "swap"] = "correct"
+    """Online-SR SF ablation: correct | zero | swap (deterministic at eval)."""
+
+    sf_swap_bank_max: int = 64
+    """Ring-buffer size for swap-mode wrong foresight (B=1 online)."""
+
 
 #####################################################################################
 
@@ -158,17 +164,17 @@ def main(args: ArgsConfig):
         # if a new data config is specified, this expect user to
         # construct your own modality config and transform
         # see gr00t/utils/data.py for more details
-        model_config = AutoConfig.from_pretrained(config.model_path)
+        model_config = AutoConfig.from_pretrained(args.model_path)
         num_bridge_tokens = model_config.bridge_cfg.get("num_bridge_tokens", 64)
         BRIDGE_TOKENS.update(num_bridge_tokens=num_bridge_tokens)
-    
 
         if hasattr(model_config, 'ignore_lang_prefix'):
             ignore_lang_prefix = model_config.ignore_lang_prefix
         else:
             ignore_lang_prefix = False
         print(f"ignore_lang_prefix: {ignore_lang_prefix}")
-        
+        print(f"sf_eval_mode: {args.sf_eval_mode} (bank_max={args.sf_swap_bank_max})")
+
         data_config = load_data_config(
             args.data_config,
             vlm_path=model_config.backbone_cfg['vlm_path'],
@@ -190,6 +196,8 @@ def main(args: ArgsConfig):
             guidance_scale=args.guidance_scale,
             async_vlm_inference=args.async_vlm_inference,
             vlm_update_period=args.vlm_update_period,
+            sf_eval_mode=args.sf_eval_mode,
+            sf_swap_bank_max=args.sf_swap_bank_max,
         )
 
         # Start the server

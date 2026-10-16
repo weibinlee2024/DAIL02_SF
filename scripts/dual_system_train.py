@@ -223,7 +223,7 @@ class ArgsConfig:
     state_future_horizon: int = None
     tune_state_future_projector: bool = True
     state_future_decoder: str = "query_ca"  # query_ca | mean_pool
-    state_future_dim: Optional[int] = None  # None -> 30 (query_ca) or 18 if wrist-only
+    state_future_dim: Optional[int] = None  # None -> data_config dim (60 w/ fingertips; 18 if wrist-only)
     state_future_num_heads: int = 8
     state_future_wrist_only: bool = False
     # additive: L=a+b+w*sf; legacy_avg: old ((a+b)/2 + w*sf)/(1+w)
@@ -232,8 +232,14 @@ class ArgsConfig:
     feed_state_future_to_dit: bool = False
     # shat: project Ŝ; mid_hidden: query_ca pre-proj (legacy)
     sf_dit_repr: str = "shat"
+    # Teacher ablations: stop-grad SF→DiT; null-drop; batch intent-swap
+    sf_tokens_detach: bool = False
+    p_sf_drop: float = 0.0
+    p_sf_swap: float = 0.0
     # Mixture-of-Transformers System-1
     use_mot_system1: bool = False
+    # Dense-CA MoT cond experts (teacher口径); exclusive with use_mot_system1
+    use_mot_cond_experts: bool = False
     mot_include_sf: bool = True
     mot_sf_num_tokens: int = 17
     # None → keep diffusion_model_cfg.num_layers; set lower to fit VRAM
@@ -362,6 +368,8 @@ def main(config: ArgsConfig):
     if getattr(config, "use_state_future", False):
         print(
             f"state_future: decoder={config.state_future_decoder} dim={sf_dim} "
+            f"detach={config.sf_tokens_detach} p_drop={config.p_sf_drop} "
+            f"p_swap={config.p_sf_swap} "
             f"heads={config.state_future_num_heads} wrist_only={config.state_future_wrist_only}"
         )
 
@@ -421,7 +429,11 @@ def main(config: ArgsConfig):
         loss_combine_mode=config.loss_combine_mode,
         feed_state_future_to_dit=config.feed_state_future_to_dit,
         sf_dit_repr=config.sf_dit_repr,
+        sf_tokens_detach=config.sf_tokens_detach,
+        p_sf_drop=config.p_sf_drop,
+        p_sf_swap=config.p_sf_swap,
         use_mot_system1=config.use_mot_system1,
+        use_mot_cond_experts=config.use_mot_cond_experts,
         mot_include_sf=config.mot_include_sf,
         mot_sf_num_tokens=config.mot_sf_num_tokens,
         mot_num_layers=config.mot_num_layers,

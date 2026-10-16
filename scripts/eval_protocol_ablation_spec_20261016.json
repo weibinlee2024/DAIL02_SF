@@ -1,0 +1,96 @@
+{
+  "query_ca_d30_multi_ckpt": [
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/query_ca_shat_w0p05_d30_to_10k/checkpoint-6000",
+      "tag": "query_ca_d30_6k",
+      "decoder": "query_ca",
+      "detach": false,
+      "step": 6000
+    },
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/query_ca_shat_w0p05_d30_to_10k/checkpoint-8000",
+      "tag": "query_ca_d30_8k",
+      "decoder": "query_ca",
+      "detach": false,
+      "step": 8000
+    },
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/query_ca_shat_w0p05_d30_to_10k/checkpoint-10000",
+      "tag": "query_ca_d30_10k",
+      "decoder": "query_ca",
+      "detach": false,
+      "step": 10000
+    }
+  ],
+  "mean_pool_d30_multi_ckpt": [
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/mean_pool_shat_w0p05/checkpoint-6000",
+      "tag": "mean_pool_d30_6k",
+      "decoder": "mean_pool",
+      "detach": false,
+      "step": 6000
+    },
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/mean_pool_shat_w0p05/checkpoint-8000",
+      "tag": "mean_pool_d30_8k",
+      "decoder": "mean_pool",
+      "detach": false,
+      "step": 8000
+    },
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/mean_pool_shat_w0p05/checkpoint-10000",
+      "tag": "mean_pool_d30_10k",
+      "decoder": "mean_pool",
+      "detach": false,
+      "step": 10000
+    }
+  ],
+  "mean_pool_detach_vs_nodetach_10k": [
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/mean_pool_shat_w0p05/checkpoint-10000",
+      "tag": "mean_pool_d30_10k",
+      "decoder": "mean_pool",
+      "detach": false,
+      "step": 10000
+    },
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/mean_pool_shat_w0p05_detach/checkpoint-10000",
+      "tag": "mean_pool_d30_10k_detach",
+      "decoder": "mean_pool",
+      "detach": true,
+      "step": 10000
+    }
+  ],
+  "query_ca_d60_detach_vs_nodetach_2k": [
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/query_ca_shat_w0p05_d60/checkpoint-2000",
+      "tag": "query_ca_d60_2k",
+      "decoder": "query_ca",
+      "detach": false,
+      "step": 2000
+    },
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/query_ca_shat_w0p05_d60_detach/checkpoint-2000",
+      "tag": "query_ca_d60_2k_detach",
+      "decoder": "query_ca",
+      "detach": true,
+      "step": 2000
+    }
+  ],
+  "query_ca_vs_mlp_d30_10k": [
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/query_ca_shat_w0p05_d30_to_10k/checkpoint-10000",
+      "tag": "query_ca_d30_10k",
+      "decoder": "query_ca",
+      "detach": false,
+      "step": 10000
+    },
+    {
+      "ckpt": "/media/weibin/weibin02/DIAL_MoT/sf_dual_channel_2k/mean_pool_shat_w0p05/checkpoint-10000",
+      "tag": "mean_pool_d30_10k",
+      "decoder": "mean_pool",
+      "detach": false,
+      "step": 10000
+    }
+  ]
+}

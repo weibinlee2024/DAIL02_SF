@@ -280,10 +280,27 @@ def _verify_writeback_keys_only():
     print("CONFIG_WRITEBACK_STATIC_OK")
 
 
+def verify_script_paths():
+    print("=== 4) SF script path suffixes ===")
+    pre = (ROOT / "scripts/run_4task_pretrain_golden_sf_4gpu.sh").read_text()
+    ft = (ROOT / "scripts/run_4task_finetune_end2end_sf_4gpu.sh").read_text()
+    assert "pretrain-golden-sf-4task" in pre
+    assert "pretrain_4task_sf.log" in pre
+    assert "finetune-end2end-sf-4task" in ft
+    assert "finetune_4task_sf.log" in ft
+    assert "pretrain-golden-sf-4task/checkpoint" in ft
+    # baseline unchanged
+    pre_b = (ROOT / "scripts/run_4task_pretrain_golden_4gpu.sh").read_text()
+    assert "pretrain-golden-4task" in pre_b and "pretrain-golden-sf-4task" not in pre_b
+    print("  SF OUT/LOG/BASE_CKPT use -sf suffix; baseline unchanged OK")
+    print("SCRIPT_PATH_VERIFY_OK")
+
+
 if __name__ == "__main__":
     verify_mask_merge()
     verify_decoder_shapes()
     verify_sf_subset_keys()
+    verify_script_paths()
     verify_config_writeback_and_projector()
     print("\nALL_CPU_VERIFICATIONS_DONE")
     print("NOTE: item 2 (action/bridge/state_future loss from training log) requires GPU retrain.")
