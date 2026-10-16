@@ -12,20 +12,29 @@
 #   PORT         - Server port (default: 50051)
 #   N_EPISODES   - Episodes per task (default: 50)
 #   DATA_CONFIG  - (default: fourier_gr1_arms_waist_aug_pos_rot_flip_wrist_only_gausNorm_crop)
+#   SF_EVAL_MODE - Online SF ablation: correct | zero | swap (default: correct)
+#   SF_SWAP_BANK_MAX - swap token bank size (default: 64)
+#   EVAL_SUBDIR  - Override results subdirectory (optional)
 
 set -euo pipefail
 
-export PATH=/home/weibin/miniconda3/envs/dial/bin:$PATH
+export PATH=/home/weibin/anaconda3/envs/dial/bin:$PATH
 
 MODEL_PATH=${1:?"Usage: bash examples/eval.sh <model_path> <eval_type>"}
-EVAL_TYPE=${2:?"Eval type: id | ood_object_appearance | ood_container_combination | ood_object_type"}
+EVAL_TYPE=${2:?"Eval type: id | id6 | ood_object_appearance | ood_container_combination | ood_object_type"}
 PORT=${PORT:-50051}
 N_EPISODES=${N_EPISODES:-50}
 DATA_CONFIG=${DATA_CONFIG:-fourier_gr1_arms_waist_aug_pos_rot_flip_wrist_only_gausNorm_crop}
+SF_EVAL_MODE=${SF_EVAL_MODE:-correct}
+SF_SWAP_BANK_MAX=${SF_SWAP_BANK_MAX:-64}
+case "$SF_EVAL_MODE" in
+  correct|zero|swap) ;;
+  *) echo "Error: SF_EVAL_MODE must be correct|zero|swap, got '$SF_EVAL_MODE'"; exit 1 ;;
+esac
 
 case "$EVAL_TYPE" in
   id)
-    EVAL_SUBDIR="evaluation_sim_id_${N_EPISODES}eps"
+    _DEFAULT_EVAL_SUBDIR="evaluation_sim_id_${N_EPISODES}eps"
     task_names=(
         gr1_unified/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env
         gr1_unified/PnPPotatoToMicrowaveClose_GR1ArmsAndWaistFourierHands_Env
@@ -51,9 +60,25 @@ case "$EVAL_TYPE" in
         gr1_unified/PosttrainPnPNovelFromTrayToPotSplitA_GR1ArmsAndWaistFourierHands_Env
         gr1_unified/PosttrainPnPNovelFromTrayToTieredbasketSplitA_GR1ArmsAndWaistFourierHands_Env
         gr1_unified/PosttrainPnPNovelFromTrayToTieredshelfSplitA_GR1ArmsAndWaistFourierHands_Env
-    ) ;;
+    )
+    EVAL_SUBDIR="${EVAL_SUBDIR:-$_DEFAULT_EVAL_SUBDIR}"
+    ;;
+  id6)
+    # 6 dual-channel offline tasks (PosttrainPnPNovel SplitA subset)
+    _DEFAULT_EVAL_SUBDIR="evaluation_sim_id6_${N_EPISODES}eps"
+    task_names=(
+        gr1_unified/PosttrainPnPNovelFromPlacematToPlateSplitA_GR1ArmsAndWaistFourierHands_Env
+        gr1_unified/PosttrainPnPNovelFromCuttingboardToPotSplitA_GR1ArmsAndWaistFourierHands_Env
+        gr1_unified/PosttrainPnPNovelFromCuttingboardToPanSplitA_GR1ArmsAndWaistFourierHands_Env
+        gr1_unified/PosttrainPnPNovelFromPlateToBowlSplitA_GR1ArmsAndWaistFourierHands_Env
+        gr1_unified/PosttrainPnPNovelFromTrayToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_Env
+        gr1_unified/PosttrainPnPNovelFromTrayToPlateSplitA_GR1ArmsAndWaistFourierHands_Env
+    )
+    EVAL_SUBDIR="${EVAL_SUBDIR:-$_DEFAULT_EVAL_SUBDIR}"
+    ;;
   ood_object_appearance)
-    EVAL_SUBDIR="evaluation_sim_ood_object_appearance_${N_EPISODES}eps"
+    _DEFAULT_EVAL_SUBDIR="evaluation_sim_ood_object_appearance_${N_EPISODES}eps"
+    EVAL_SUBDIR="${EVAL_SUBDIR:-$_DEFAULT_EVAL_SUBDIR}"
     task_names=(
         gr1_unified/EvalPnPNovelFromCuttingboardToBasketSplitB_GR1ArmsAndWaistFourierHands_Env
         gr1_unified/EvalPnPNovelFromCuttingboardToCardboardboxSplitB_GR1ArmsAndWaistFourierHands_Env
@@ -131,12 +156,20 @@ case "$EVAL_TYPE" in
   *) echo "Error: Unknown EVAL_TYPE '$EVAL_TYPE'."; exit 1 ;;
 esac
 
+# Append sf mode to subdir unless caller overrode EVAL_SUBDIR explicitly
+if [[ -z "${EVAL_SUBDIR_SET:-}" && "$SF_EVAL_MODE" != "correct" ]]; then
+  EVAL_SUBDIR="${EVAL_SUBDIR}_sf_${SF_EVAL_MODE}"
+elif [[ -z "${EVAL_SUBDIR_SET:-}" && "$SF_EVAL_MODE" == "correct" && "${FORCE_SF_TAG:-0}" == "1" ]]; then
+  EVAL_SUBDIR="${EVAL_SUBDIR}_sf_correct"
+fi
+
 echo "=============================================="
 echo "DIAL Evaluation"
 echo "  MODEL_PATH: $MODEL_PATH"
 echo "  EVAL_TYPE:  $EVAL_TYPE ($EVAL_SUBDIR)"
 echo "  PORT:       $PORT"
 echo "  N_EPISODES: $N_EPISODES"
+echo "  SF_EVAL_MODE: $SF_EVAL_MODE"
 echo "  TASKS:      ${#task_names[@]}"
 echo "=============================================="
 
@@ -148,10 +181,32 @@ nohup python3 -u scripts/inference_service_dial.py --server \
     --model_path "$MODEL_PATH" \
     --port "$PORT" \
     --data_config "$DATA_CONFIG" \
+    --sf_eval_mode "$SF_EVAL_MODE" \
+    --sf_swap_bank_max "$SF_SWAP_BANK_MAX" \
     > "$MODEL_PATH/$EVAL_SUBDIR/server.log" 2>&1 &
 SERVER_PID=$!
-echo "Server started (PID: $SERVER_PID), waiting 30s..."
-sleep 30s
+echo "Server started (PID: $SERVER_PID), waiting until ready (max ${SERVER_WAIT_SEC:-900}s)..."
+ready=0
+waited=0
+SERVER_WAIT_SEC=${SERVER_WAIT_SEC:-900}
+while [[ $waited -lt $SERVER_WAIT_SEC ]]; do
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "ERROR: server PID $SERVER_PID exited before ready; see $MODEL_PATH/$EVAL_SUBDIR/server.log"
+    break
+  fi
+  if rg -q 'Server is ready and listening' "$MODEL_PATH/$EVAL_SUBDIR/server.log" 2>/dev/null; then
+    ready=1
+    echo "Server ready after ${waited}s"
+    break
+  fi
+  sleep 5
+  waited=$((waited + 5))
+done
+if [[ $ready -ne 1 ]]; then
+  echo "ERROR: server not ready after ${SERVER_WAIT_SEC}s"
+  kill -9 "$SERVER_PID" 2>/dev/null || true
+  exit 1
+fi
 
 cleanup() { kill -9 "$SERVER_PID" 2>/dev/null || true; }
 trap cleanup EXIT
