@@ -15,18 +15,34 @@
 #   SF_EVAL_MODE - Online SF ablation: correct | zero | swap (default: correct)
 #   SF_SWAP_BANK_MAX - swap token bank size (default: 64)
 #   EVAL_SUBDIR  - Override results subdirectory (optional)
+#   N_ACTION_STEPS - Actions executed per env step. Unset keeps the sim default (16).
+#                    WM online K-sweep must set N_ACTION_STEPS=8 so execution matches
+#                    the scored window t+1..t+8.
+#   WM_CKPT      - Frozen WM verifier .pt for Best-of-N (optional; required if BON_K>1)
+#   BON_K        - BoN candidates (default 1 = no selection)
+#   BON_SEED     - BoN base seed (default 0)
 
 set -euo pipefail
 
+_EVAL_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$_EVAL_ROOT"
 export PATH=/home/weibin/anaconda3/envs/dial/bin:$PATH
+export PYTHONPATH="${_EVAL_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 
 MODEL_PATH=${1:?"Usage: bash examples/eval.sh <model_path> <eval_type>"}
 EVAL_TYPE=${2:?"Eval type: id | id6 | ood_object_appearance | ood_container_combination | ood_object_type"}
 PORT=${PORT:-50051}
 N_EPISODES=${N_EPISODES:-50}
+N_ACTION_STEPS=${N_ACTION_STEPS:-}
 DATA_CONFIG=${DATA_CONFIG:-fourier_gr1_arms_waist_aug_pos_rot_flip_wrist_only_gausNorm_crop}
 SF_EVAL_MODE=${SF_EVAL_MODE:-correct}
 SF_SWAP_BANK_MAX=${SF_SWAP_BANK_MAX:-64}
+WM_CKPT=${WM_CKPT:-}
+BON_K=${BON_K:-1}
+BON_SEED=${BON_SEED:-0}
+if [[ "$BON_K" -gt 1 && -z "$WM_CKPT" ]]; then
+  echo "Error: BON_K=$BON_K requires WM_CKPT"; exit 1
+fi
 case "$SF_EVAL_MODE" in
   correct|zero|swap) ;;
   *) echo "Error: SF_EVAL_MODE must be correct|zero|swap, got '$SF_EVAL_MODE'"; exit 1 ;;
@@ -176,6 +192,14 @@ echo "=============================================="
 mkdir -p "$MODEL_PATH/$EVAL_SUBDIR"
 CLIENT_LOG="$MODEL_PATH/$EVAL_SUBDIR/client.log"
 
+wm_args=()
+if [[ -n "$WM_CKPT" ]]; then
+    wm_args=(--wm_ckpt "$WM_CKPT" --bon_k "$BON_K" --bon_seed "$BON_SEED")
+elif [[ "$BON_K" -ne 1 ]]; then
+    wm_args=(--bon_k "$BON_K" --bon_seed "$BON_SEED")
+fi
+echo "WM_CKPT=${WM_CKPT:-'(none)'} BON_K=$BON_K N_ACTION_STEPS=${N_ACTION_STEPS:-'(default)'}"
+
 nohup python3 -u scripts/inference_service_dial.py --server \
     --embodiment_tag gr1 \
     --model_path "$MODEL_PATH" \
@@ -183,6 +207,7 @@ nohup python3 -u scripts/inference_service_dial.py --server \
     --data_config "$DATA_CONFIG" \
     --sf_eval_mode "$SF_EVAL_MODE" \
     --sf_swap_bank_max "$SF_SWAP_BANK_MAX" \
+    "${wm_args[@]}" \
     > "$MODEL_PATH/$EVAL_SUBDIR/server.log" 2>&1 &
 SERVER_PID=$!
 echo "Server started (PID: $SERVER_PID), waiting until ready (max ${SERVER_WAIT_SEC:-900}s)..."
@@ -211,18 +236,29 @@ fi
 cleanup() { kill -9 "$SERVER_PID" 2>/dev/null || true; }
 trap cleanup EXIT
 
+SKIP_VIDEO=${SKIP_VIDEO:-0}
+export EVAL_RESULTS_JSON="$MODEL_PATH/$EVAL_SUBDIR/results.json"
 for task_name in "${task_names[@]}"; do
-    echo "Evaluating: $task_name"
+    echo "Evaluating: $task_name (SKIP_VIDEO=$SKIP_VIDEO)"
     retry=0; max_retries=5; ok=0
     while [ $retry -lt $max_retries ] && [ $ok -eq 0 ]; do
+        action_step_args=()
+        if [[ -n "$N_ACTION_STEPS" ]]; then
+            action_step_args=(--n_action_steps "$N_ACTION_STEPS")
+        fi
+        video_args=()
+        if [[ "$SKIP_VIDEO" != "1" ]]; then
+            video_args=(--video_dir "$MODEL_PATH/$EVAL_SUBDIR/videos/$task_name")
+        fi
         python3 -u scripts/simulation_service_dial_augPosRot.py --client \
             --env_name "$task_name" \
             --model_path "$MODEL_PATH" \
-            --video_dir "$MODEL_PATH/$EVAL_SUBDIR/videos/$task_name" \
+            "${video_args[@]}" \
             --max_episode_steps 720 \
             --n_envs 1 \
             --n_episodes "$N_EPISODES" \
-            --port "$PORT" 2>&1 | tee -a "$CLIENT_LOG" && ok=1 || { retry=$((retry+1)); sleep 5; }
+            --port "$PORT" \
+            "${action_step_args[@]}" 2>&1 | tee -a "$CLIENT_LOG" && ok=1 || { retry=$((retry+1)); sleep 5; }
     done
     [ $ok -eq 0 ] && echo "FAILED: $task_name"
     echo "==================================================" | tee -a "$CLIENT_LOG"
