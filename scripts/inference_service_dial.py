@@ -105,6 +105,15 @@ class ArgsConfig:
     sf_swap_bank_max: int = 64
     """Ring-buffer size for swap-mode wrong foresight (B=1 online)."""
 
+    wm_ckpt: str = ""
+    """Optional frozen WM verifier .pt for Best-of-N action selection."""
+
+    bon_k: int = 1
+    """Number of action candidates to sample (1 = baseline, no BoN)."""
+
+    bon_seed: int = 0
+    """Base seed for BoN candidate resampling."""
+
 
 #####################################################################################
 
@@ -174,6 +183,7 @@ def main(args: ArgsConfig):
             ignore_lang_prefix = False
         print(f"ignore_lang_prefix: {ignore_lang_prefix}")
         print(f"sf_eval_mode: {args.sf_eval_mode} (bank_max={args.sf_swap_bank_max})")
+        print(f"wm_bon: k={args.bon_k} ckpt={args.wm_ckpt or '(none)'}")
 
         data_config = load_data_config(
             args.data_config,
@@ -198,6 +208,9 @@ def main(args: ArgsConfig):
             vlm_update_period=args.vlm_update_period,
             sf_eval_mode=args.sf_eval_mode,
             sf_swap_bank_max=args.sf_swap_bank_max,
+            wm_ckpt=args.wm_ckpt or None,
+            bon_k=args.bon_k,
+            bon_seed=args.bon_seed,
         )
 
         # Start the server
