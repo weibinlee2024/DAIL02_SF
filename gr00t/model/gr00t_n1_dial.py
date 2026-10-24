@@ -450,8 +450,9 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                 # Type emb to distinguish proprio foresight tokens from visual bridge pack
                 self.proprio_foresight_type_emb = nn.Parameter(torch.zeros(1, 1, hidden))
                 nn.init.normal_(self.proprio_foresight_type_emb, mean=0.0, std=0.02)
-                # Learnable null SF for p_sf_drop / CFG uncond arm / ablation
-                self.null_sf_embed = nn.Parameter(torch.zeros(1, 1, hidden))
+                # One null token per foresight frame. Checkpoints store [1, T, H]
+                # (T = horizon + 1). A length-1 parameter cannot load those weights.
+                self.null_sf_embed = nn.Parameter(torch.zeros(1, num_frames, hidden))
                 nn.init.normal_(self.null_sf_embed, mean=0.0, std=0.02)
                 self.null_sf_embed.requires_grad_(self.tune_state_future_projector)
                 if self.sf_dit_repr == "shat":
@@ -593,6 +594,7 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
         batch_size = inputs['state'].shape[0]
 
         output_dict = {}
+        pred_state_future = None
         if self.use_bridge:
             if self.vlm_small_lr is not None:
                 backbone_outputs['backbone_features'] = backbone_outputs['backbone_features'] * self.vlm_small_lr + backbone_outputs['backbone_features'].detach() * (1-self.vlm_small_lr)
@@ -1009,9 +1011,12 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
         else:
             action_head_outputs = self.action_head.get_action(bridge_outputs, action_inputs, guidance_scale=guidance_scale)
             self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
-            
+
             action_head_outputs.update(output_dict)
             action_head_outputs["backbone_features"] = raw_backbone_features
+            # Inference only. Training loss must not see this tensor (.item() logging).
+            if pred_state_future is not None:
+                action_head_outputs["pred_state_future"] = pred_state_future
             return action_head_outputs
 
     def _run_bridge_vision(self, vision_model, inputs_dict, batch_size: int):

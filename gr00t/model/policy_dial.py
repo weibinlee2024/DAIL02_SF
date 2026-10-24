@@ -77,6 +77,9 @@ class DialPolicy(BasePolicy):
         vlm_update_period: int = 3,        # <-- New: VLM update frequency
         sf_eval_mode: str = "correct",
         sf_swap_bank_max: int = 64,
+        wm_ckpt: Optional[str] = None,
+        bon_k: int = 1,
+        bon_seed: int = 0,
     ):
         """
         Initialize the DialPolicy.
@@ -90,6 +93,9 @@ class DialPolicy(BasePolicy):
             device (Union[int, str]): Device to run the model on.
             sf_eval_mode: Online-SR SF ablation — correct | zero | swap.
             sf_swap_bank_max: Ring-buffer size for swap-mode wrong foresight.
+            wm_ckpt: Optional frozen WM verifier .pt for Best-of-N action selection.
+            bon_k: Number of action candidates to sample (1 = no BoN).
+            bon_seed: Base seed for candidate resampling.
         """
         try:
             # NOTE(YL) this returns the local path to the model which is normally
@@ -142,6 +148,22 @@ class DialPolicy(BasePolicy):
             raise RuntimeError(
                 f"sf_eval_mode={self.sf_eval_mode!r} requested but model has no set_sf_eval_mode"
             )
+
+        self.bon_k = max(int(bon_k), 1)
+        self.bon_seed = int(bon_seed)
+        self._wm_bon = None
+        if wm_ckpt:
+            from gr00t.model.wm_verifier.online_bon import OnlineWMBoN
+
+            self._wm_bon = OnlineWMBoN(
+                wm_ckpt=wm_ckpt,
+                policy_metadata=self.metadata,
+                device=self.device,
+                bon_k=self.bon_k,
+            )
+            print(f"[DialPolicy] WM-BoN enabled k={self.bon_k} ckpt={wm_ckpt}", flush=True)
+        elif self.bon_k > 1:
+            raise ValueError("bon_k>1 requires wm_ckpt")
 
     def set_sf_eval_mode(self, mode: str = "correct", bank_max: int | None = None) -> None:
         """Proxy to GR00T_N1_5_DIAL.set_sf_eval_mode for online-SR arms."""
@@ -213,12 +235,67 @@ class DialPolicy(BasePolicy):
 
         normalized_input = self.apply_transforms(obs_copy)
         normalized_input['guidance_scale'] = self._guidance_scale
-        normalized_action = self._get_action_from_normalized_input(normalized_input)
+
+        if self._wm_bon is not None and self.bon_k > 1:
+            # Prefer post-transform state (same space as WM training); fall back to raw.
+            s_t_for_bon = self._wm_bon.extract_s_t_from_normalized(normalized_input)
+            if s_t_for_bon is None:
+                raise RuntimeError(
+                    "WM-BoN could not read s_t from normalized state "
+                    "(expected state[:, :18] wrist pos+rot6d)"
+                )
+            normalized_action = self._get_action_bon(normalized_input, s_t_for_bon)
+        else:
+            normalized_action = self._get_action_from_normalized_input(normalized_input)
         unnormalized_action = self._get_unnormalized_action(normalized_action, normalized_input)
 
         if not is_batch:
             unnormalized_action = squeeze_dict_values(unnormalized_action)
         return unnormalized_action
+
+    def _get_action_bon(self, normalized_input: Dict[str, Any], s_t: torch.Tensor) -> torch.Tensor:
+        """Sample K action chunks, score with WM vs pred_sf, return the best [1,H,D]."""
+
+        def _clone(value):
+            if isinstance(value, torch.Tensor):
+                return value.clone()
+            if isinstance(value, np.ndarray):
+                return value.copy()
+            if isinstance(value, dict):
+                return {k: _clone(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_clone(v) for v in value]
+            return value
+
+        seed_base = self._wm_bon.next_seed_base(self.bon_seed)
+        cands = []
+        pred_sf = None
+        for i in range(self.bon_k):
+            torch.manual_seed(seed_base + 10007 * (i + 1))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed_base + 10007 * (i + 1))
+            copied = _clone(normalized_input)
+            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+                model_pred = self.model.get_action(copied)
+            a = model_pred["action_pred"].float()
+            if a.ndim == 3:
+                a = a[0]
+            cands.append(a.detach())
+            # pred_sf is independent of action noise — take first forward (matches offline).
+            if pred_sf is None and model_pred.get("pred_state_future") is not None:
+                psf = model_pred["pred_state_future"].detach().float()
+                if psf.ndim == 3:
+                    psf = psf[0]
+                pred_sf = psf
+        if pred_sf is None:
+            raise RuntimeError("WM-BoN needs pred_state_future from policy get_action")
+        stacked = torch.stack(cands, dim=0)  # [K,H,D]
+        best, scores = self._wm_bon.select(stacked, s_t, pred_sf)
+        print(
+            f"[WM-BoN] pick={best}/{self.bon_k} scores={np.array2string(scores, precision=4)}",
+            flush=True,
+        )
+        return stacked[best].unsqueeze(0)
 
     def get_action_and_bridgeloss(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         # Create a copy to avoid mutating input
