@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from typing import Any, Optional
 
@@ -135,6 +137,68 @@ def _build_wm_transforms(data_config_cls) -> ComposedModalityTransform:
     return ComposedModalityTransform(transforms=transforms)
 
 
+def _walk_transforms(transform):
+    children = getattr(transform, "transforms", None)
+    if children:
+        for child in children:
+            yield from _walk_transforms(child)
+    else:
+        yield transform
+
+
+def normalization_snapshot(transforms) -> dict:
+    """Mean/std actually installed on the state/action normalizers."""
+    keys = {}
+    for transform in _walk_transforms(transforms):
+        stats = getattr(transform, "normalization_statistics", None) or {}
+        modes = getattr(transform, "normalization_modes", None) or {}
+        if not isinstance(stats, dict):
+            continue
+        for key, st in stats.items():
+            if not isinstance(st, dict):
+                continue
+            mean = st.get("mean")
+            std = st.get("std")
+            keys[key] = {
+                "mode": modes.get(key),
+                "mean": None if mean is None else [round(float(x), 8) for x in mean],
+                "std": None if std is None else [round(float(x), 8) for x in std],
+            }
+    blob = json.dumps(keys, sort_keys=True)
+    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    return {"keys": keys, "fingerprint": digest}
+
+
+def lock_norm_to_policy(dataset, policy_path: str) -> dict:
+    """Overwrite mixture stats with the frozen policy checkpoint metadata.
+
+    Dataset init computes per-task stats and the mixture then overwrites the
+    shared transforms with a weighted average. Scoring and WM training must
+    both use the policy's experiment_cfg/metadata.json instead.
+    """
+    from gr00t.data.dataset import load_metadata
+
+    policy_path = os.path.realpath(policy_path)
+    metadatas = load_metadata(policy_path)
+    datasets = dataset.datasets if hasattr(dataset, "datasets") else [dataset]
+    for ds in datasets:
+        metadata = metadatas.get(ds.tag)
+        if metadata is None:
+            raise KeyError(
+                f"policy metadata has no embodiment tag {ds.tag!r} ({policy_path})"
+            )
+        ds.set_transforms_metadata(metadata)
+    if hasattr(dataset, "merged_metadata"):
+        dataset.merged_metadata = metadatas
+    snap = normalization_snapshot(datasets[0].transforms)
+    return {
+        "norm_source": policy_path,
+        "norm_fingerprint": snap["fingerprint"],
+        "norm_snapshot": snap["keys"],
+        "stats_version": 2,
+    }
+
+
 def build_wm_train_dataset(
     dataset_paths: list[str],
     data_config: str = "fourier_gr1_arms_waist_aug_pos_rot_flip_wrist_only_gausNorm_crop",
@@ -142,6 +206,7 @@ def build_wm_train_dataset(
     embodiment_tag: str = "gr1",
     state_future_dim: int = 30,
     video_backend: str = "decord",
+    policy_path: Optional[str] = None,
 ):
     """Same offline tasks as DIAL; labels from state_future / action transforms."""
     os.environ["SF_FORCE_KEY_DIM"] = "30" if state_future_dim != 60 else "60"
@@ -190,7 +255,14 @@ def build_wm_train_dataset(
         "state_future_dim": data_config_cls.get_state_future_dim(),
         "pos_rot_dim": POS_ROT_DIM,
         "data_config": data_config,
+        "state_keys": list(data_config_cls.state_future_keys),
+        "action_delta_indices": list(modality_configs["action"].delta_indices),
+        "state_future_delta_indices": list(modality_configs["state_future"].delta_indices),
+        "data_split": data_split,
     }
+    if policy_path:
+        # Must run after mixture init, which otherwise installs its own stats.
+        meta.update(lock_norm_to_policy(mixed, policy_path))
     return mixed, meta
 
 

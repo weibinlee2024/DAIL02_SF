@@ -117,37 +117,36 @@ class GroupNormMSE(nn.Module):
         pos_idx, rot_idx = pos_rot_slices(state_dim)
         self.register_buffer("pos_idx", pos_idx, persistent=True)
         self.register_buffer("rot_idx", rot_idx, persistent=True)
-        # Running second moment (E[x^2]) per group; std = sqrt(moment).
-        self.register_buffer("pos_moment", torch.ones(()), persistent=True)
-        self.register_buffer("rot_moment", torch.ones(()), persistent=True)
-        self.register_buffer("n_seen", torch.zeros((), dtype=torch.long), persistent=True)
+        # Per-dimension mean/variance on valid frames. Batches accumulate by
+        # frame count (not one vote per batch). variance = E[x^2] - E[x]^2.
+        self.register_buffer("sum_x", torch.zeros(state_dim), persistent=True)
+        self.register_buffer("sum_x2", torch.zeros(state_dim), persistent=True)
+        self.register_buffer("count", torch.zeros((), dtype=torch.float64), persistent=True)
+
+    def dim_std(self) -> torch.Tensor:
+        """Per-dimension std. Variance is floored at eps before the square root."""
+        c = self.count.to(dtype=self.sum_x.dtype).clamp_min(1.0)
+        mean = self.sum_x / c
+        var = self.sum_x2 / c - mean.square()
+        return var.clamp_min(self.eps).sqrt()
 
     @torch.no_grad()
     def update_stats(self, gt: torch.Tensor, mask: Optional[torch.Tensor] = None) -> None:
-        """Accumulate group E[x^2] from GT [B,T,D]. Optional mask [B,T]."""
-        x = gt[..., SUP_FRAME_SLICE, :]
+        """Accumulate per-dim sum and sum-of-squares on supervised frames.
+
+        gt: [B, T, D]. mask: optional [B, T] (True = valid). Frame 0 is excluded
+        (same slice as the loss). Each valid frame adds 1 to ``count`` for every dim.
+        """
+        x = gt[..., SUP_FRAME_SLICE, :].detach()
         if mask is not None:
-            m = mask[..., SUP_FRAME_SLICE].to(dtype=x.dtype).unsqueeze(-1)
+            m = mask[..., SUP_FRAME_SLICE].to(dtype=x.dtype)
         else:
-            m = torch.ones(*x.shape[:2], 1, device=x.device, dtype=x.dtype)
-        w = m.sum().clamp_min(1.0)
-
-        def _moment(idx: torch.Tensor) -> torch.Tensor:
-            g = x.index_select(-1, idx)
-            return (g.square() * m).sum() / (w * g.shape[-1])
-
-        pos_m = _moment(self.pos_idx)
-        rot_m = _moment(self.rot_idx)
-        n = self.n_seen.to(dtype=torch.float32)
-        n1 = n + 1.0
-        self.pos_moment.mul_(n / n1).add_(pos_m / n1)
-        self.rot_moment.mul_(n / n1).add_(rot_m / n1)
-        self.n_seen.add_(1)
-
-    def set_group_std(self, pos_std: float, rot_std: float) -> None:
-        self.pos_moment.fill_(max(float(pos_std) ** 2, self.eps))
-        self.rot_moment.fill_(max(float(rot_std) ** 2, self.eps))
-        self.n_seen.fill_(1)
+            m = torch.ones(x.shape[:2], device=x.device, dtype=x.dtype)
+        # [B, T, 1] so a temporal mask applies to every dimension.
+        m3 = m.unsqueeze(-1)
+        self.sum_x.add_((x * m3).sum(dim=(0, 1)).to(self.sum_x.dtype))
+        self.sum_x2.add_((x.square() * m3).sum(dim=(0, 1)).to(self.sum_x2.dtype))
+        self.count.add_(m.sum().to(dtype=self.count.dtype))
 
     def _group_mse(
         self,
@@ -160,15 +159,15 @@ class GroupNormMSE(nn.Module):
         else:
             m = torch.ones(*pred.shape[:2], 1, device=pred.device, dtype=pred.dtype)
         w = m.sum().clamp_min(1.0)
-        pos_std = self.pos_moment.sqrt().clamp_min(self.eps)
-        rot_std = self.rot_moment.sqrt().clamp_min(self.eps)
+        std = self.dim_std()
 
-        def _one(idx: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-            err = (pred.index_select(-1, idx) - gt.index_select(-1, idx)) / std
+        def _one(idx: torch.Tensor) -> torch.Tensor:
+            gstd = std.index_select(0, idx).view(1, 1, -1)
+            err = (pred.index_select(-1, idx) - gt.index_select(-1, idx)) / gstd
             return (err.square() * m).sum() / (w * idx.numel())
 
-        pos_l = _one(self.pos_idx, pos_std)
-        rot_l = _one(self.rot_idx, rot_std)
+        pos_l = _one(self.pos_idx)
+        rot_l = _one(self.rot_idx)
         return pos_l + rot_l, pos_l, rot_l
 
     def forward(
@@ -238,11 +237,11 @@ class GroupNormMSE(nn.Module):
         else:
             m = torch.ones(*p.shape[:2], 1, device=pred.device, dtype=pred.dtype)
         w = m.sum(dim=(1, 2)).clamp_min(1.0)  # [B]
-        pos_std = self.pos_moment.sqrt().clamp_min(self.eps)
-        rot_std = self.rot_moment.sqrt().clamp_min(self.eps)
+        std = self.dim_std()
 
-        def _one(idx: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-            err = (p.index_select(-1, idx) - g.index_select(-1, idx)) / std
+        def _one(idx: torch.Tensor) -> torch.Tensor:
+            gstd = std.index_select(0, idx).view(1, 1, -1)
+            err = (p.index_select(-1, idx) - g.index_select(-1, idx)) / gstd
             return (err.square() * m).sum(dim=(1, 2)) / (w * idx.numel())
 
-        return _one(self.pos_idx, pos_std) + _one(self.rot_idx, rot_std)
+        return _one(self.pos_idx) + _one(self.rot_idx)
