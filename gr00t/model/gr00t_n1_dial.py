@@ -51,7 +51,7 @@ N_COLOR_CHANNELS = 3
 # Default SF target width: dual-arm wrist pos+rot6d + 6-DoF hands (no padding).
 # 2026-10-11: default SF target dim 30 -> 60 (+10 fingertip pos).
 # Pre-change backup: bake20261011_sf_d30/
-DEFAULT_STATE_FUTURE_DIM = 60
+DEFAULT_STATE_FUTURE_DIM = 30  # mainline mean_pool+motcond; set SF_FORCE_KEY_DIM=60 for fingertips
 DEFAULT_STATE_FUTURE_NUM_HEADS = 8
 VALID_STATE_FUTURE_DECODERS = ("query_ca", "mean_pool")
 
@@ -1509,6 +1509,8 @@ class GR00T_N1_5_DIAL(PreTrainedModel):
                         raise NotImplementedError
 
         except Exception as e:
+            if kwargs.get("ignore_mismatched_sizes"):
+                raise
             print(f"Load pretrained model error!!!! {e}")
             config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=True)
             pretrained_model = cls(
