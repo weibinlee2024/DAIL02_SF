@@ -69,6 +69,8 @@ class SimulationConfig:
     video: VideoConfig = field(default_factory=VideoConfig)
     multistep: MultiStepConfig = field(default_factory=MultiStepConfig)
     state_modality_keys: set = field(default_factory=set)
+    # Per-episode env seed: env_seed = seed_base + episode_id (matches teacher probe).
+    seed_base: int = 20261028
 
 
 class SimulationInferenceClient(BaseInferenceClient, BasePolicy):
@@ -113,10 +115,15 @@ class SimulationInferenceClient(BaseInferenceClient, BasePolicy):
         completed_episodes = 0
         current_successes = [False] * config.n_episodes
         episode_successes = []
-        # Initial environment reset
-        obs, _ = self.env.reset()
-        # Main simulation loop
+        # Main simulation loop — one seeded reset per episode (same formula as teacher probe).
+        print(
+            f"Episode seeds: env_seed = seed_base + episode_id "
+            f"(seed_base={int(config.seed_base)}, n_episodes={config.n_episodes})",
+            flush=True,
+        )
         for ep_id in range(config.n_episodes):
+            env_seed = int(config.seed_base) + int(ep_id)
+            obs, _ = self.env.reset(seed=env_seed)
             while True:
                 # Process observations and get actions from the server
                 obs = {k: v[None, :] if not type(v) == str else (v,) for k, v in obs.items()}
@@ -130,15 +137,13 @@ class SimulationInferenceClient(BaseInferenceClient, BasePolicy):
                 current_lengths[ep_id] += 1
                 obs = next_obs
 
-                # If episode ended, store results
+                # If episode ended, store results (next ep resets with its own seed above)
                 if terminations or truncations:
                     episode_lengths.append(current_lengths[ep_id])
                     episode_successes.append(current_successes[ep_id])
                     completed_episodes += 1
-                    # Reset environment
-                    obs, _ = self.env.reset()
                     break
-            
+
         # Clean up
         self.env.close()
         self.env = None
@@ -168,23 +173,23 @@ def _create_single_env(config: SimulationConfig, idx: int) -> gym.Env:
     """Create a single environment with appropriate wrappers."""
     # Create base environment
     env = gym.make(config.env_name, enable_render=True)
-    # Add video recording wrapper if needed (only for the first environment)
-    if config.video.video_dir is not None:
-        video_recorder = VideoRecorder.create_h264(
-            fps=config.video.fps,
-            codec=config.video.codec,
-            input_pix_fmt=config.video.input_pix_fmt,
-            crf=config.video.crf,
-            thread_type=config.video.thread_type,
-            thread_count=config.video.thread_count
-        )
-        env = VideoRecordingWrapper(
-            env,
-            video_recorder,
-            video_dir=Path(config.video.video_dir),
-            steps_per_render=config.video.steps_per_render,
-            state_modality_keys=config.state_modality_keys
-        )
+    # Always wrap: VideoRecordingWrapper also injects wrist pos/rot6d into obs.
+    # When video_dir is None, it skips muxing (avoids flaky PyAV failures).
+    video_recorder = VideoRecorder.create_h264(
+        fps=config.video.fps,
+        codec=config.video.codec,
+        input_pix_fmt=config.video.input_pix_fmt,
+        crf=config.video.crf,
+        thread_type=config.video.thread_type,
+        thread_count=config.video.thread_count,
+    )
+    env = VideoRecordingWrapper(
+        env,
+        video_recorder,
+        video_dir=Path(config.video.video_dir) if config.video.video_dir else None,
+        steps_per_render=config.video.steps_per_render,
+        state_modality_keys=config.state_modality_keys,
+    )
     # Add multi-step wrapper
     env = MultiStepWrapper(
         env,
@@ -206,7 +211,8 @@ def run_evaluation(
     n_envs: int = 1,
     n_action_steps: int = 2,
     max_episode_steps: int = 100,
-    video_delta_indices: np.ndarray = np.array([0])
+    video_delta_indices: np.ndarray = np.array([0]),
+    seed_base: int = 20261028,
 ) -> Tuple[str, List[bool]]:
     """
     Simple entry point to run a simulation evaluation.
@@ -219,6 +225,7 @@ def run_evaluation(
         n_envs: Number of parallel environments
         n_action_steps: Number of action steps per environment step
         max_episode_steps: Maximum number of steps per episode
+        seed_base: Episode i uses env.reset(seed=seed_base + i)
     Returns:
         Tuple of environment name and list of episode success flags
     """
@@ -231,6 +238,7 @@ def run_evaluation(
         multistep=MultiStepConfig(
             n_action_steps=n_action_steps, max_episode_steps=max_episode_steps
         ),
+        seed_base=seed_base,
     )
     # Create client and run simulation
     client = SimulationInferenceClient(host=host, port=port)
