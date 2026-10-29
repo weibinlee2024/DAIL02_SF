@@ -67,6 +67,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_episode_steps", type=int, help="Maximum number of steps per episode.", default=1440
     )
+    parser.add_argument(
+        "--seed_base",
+        type=int,
+        default=int(os.environ.get("EVAL_SEED_BASE", "20261028")),
+        help="Episode i uses env.reset(seed=seed_base + i). Default 20261028 (matches teacher probe).",
+    )
     # server mode
     parser.add_argument("--server", action="store_true", help="Run the server.")
     # client mode
@@ -95,7 +101,16 @@ if __name__ == "__main__":
         print(f"video_delta_indices: {video_delta_indices}")
 
         env_name = args.env_name
-        result_path = os.path.join(os.path.split(args.video_dir.replace(f"videos/{env_name}",""))[0], "results.json")
+        if args.video_dir:
+            result_path = os.path.join(
+                os.path.split(args.video_dir.replace(f"videos/{env_name}", ""))[0],
+                "results.json",
+            )
+        else:
+            result_path = os.environ.get(
+                "EVAL_RESULTS_JSON",
+                os.path.join(args.model_path, "results.json"),
+            )
         print(os.path.exists(result_path), result_path)
         if os.path.exists(result_path):
             with open(result_path) as f:
@@ -126,8 +141,10 @@ if __name__ == "__main__":
                 n_action_steps=args.n_action_steps, max_episode_steps=args.max_episode_steps,
                 video_delta_indices=video_delta_indices
             ),
-            state_modality_keys=set(modality_config['state'].modality_keys)
+            state_modality_keys=set(modality_config['state'].modality_keys),
+            seed_base=int(args.seed_base),
         )
+        print(f"seed_base={config.seed_base} (env_seed = seed_base + episode_id)")
 
         # Run the simulation
         print(f"Running simulation for {args.env_name}...")
