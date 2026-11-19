@@ -22,6 +22,12 @@ class EmbodimentTag(Enum):
     The GR1 dataset.
     """
 
+    LIBERO = "libero"
+    """
+    LIBERO / LIBERO-plus (Franka, 7-D delta EEF action).
+    Shares the new-embodiment projector slot (index 31).
+    """
+
     OXE_DROID = "oxe_droid"
     """
     The OxE Droid dataset.
@@ -49,6 +55,7 @@ EMBODIMENT_TAG_MAPPING = {
     EmbodimentTag.OXE_DROID.value: 17,
     EmbodimentTag.AGIBOT_GENIE1.value: 26,
     EmbodimentTag.GR1.value: 24,
+    EmbodimentTag.LIBERO.value: 31,
 
     EmbodimentTag.HUMAN_EGODEX.value: 0,
     EmbodimentTag.IRON.value: 1,
