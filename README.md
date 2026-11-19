@@ -1,218 +1,594 @@
-# DIAL02 — State-Future / MoT 增量版
+# DIAL02-SF: State-Future and World-Model Extensions for DIAL
 
-本文档汇总本仓库相对 GitHub 原版 **`DIAL02-main`** 的**完整差异**（代码、配置、脚本、清理）。
+Also referred to as **DIAL-SF-WM**.
 
-- **基线**：`weibinlee2024/DIAL02` @ `986a7dd`（2026-09-08，即下载包 `DIAL02-main`）
-- **本分支**：新增 `query_ca` 状态未来解码器、可选回灌 System-1、可选 MoT（`vis|sf|act`），并清理历史实验脚本
-- 原 `docs/` 设计文档已删除，其内容已合并进本文档
-- 复核命令：
+[Public repository](https://github.com/weibinlee2024/DAIL02_SF) · Research preview
+
+DIAL02-SF is a research fork of **DIAL02**, built on **GR00T N1.5** and a dual-system robot policy. It extends the original DIAL pipeline with:
+
+- a **State-Future (SF)** predictor for future end-effector states;
+- an optional **SF-to-System-1** feedback path;
+- an optional **Mixture-of-Transformers (MoT)** System-1;
+- a **bridge / world-model** branch that learns from future visual goals;
+- recipes for GR1/RoboCasa-style tabletop manipulation and an experimental LIBERO-plus pipeline.
+
+> **Status:** research code, not a production library and not an official NVIDIA or DIAL release. Interfaces, scripts, and defaults may change. Reproduction requires a local GPU environment and external datasets/checkpoints.
+
+---
+
+## Contents
+
+- [What This Repository Provides](#what-this-repository-provides)
+- [Architecture](#architecture)
+- [Status](#status)
+- [Repository Layout](#repository-layout)
+- [Installation](#installation)
+- [Data Preparation](#data-preparation)
+- [Training](#training)
+- [Evaluation](#evaluation)
+- [Checkpoints](#checkpoints)
+- [Configuration Reference](#configuration-reference)
+- [Verification and Smoke Tests](#verification-and-smoke-tests)
+- [Relationship to DIAL02](#relationship-to-dial02)
+- [Troubleshooting](#troubleshooting)
+- [License and Acknowledgements](#license-and-acknowledgements)
+- [Contact](#contact)
+
+---
+
+## What This Repository Provides
+
+DIAL02-SF keeps the original DIAL dual-system design:
+
+- **System 2:** a VLM backbone that encodes images, language, and proprioception, and produces bridge tokens.
+- **System 1:** a diffusion/flow-matching action expert that predicts an action chunk.
+- **Bridge / world model:** a future-image latent objective that trains the bridge representation.
+
+This fork adds three research directions:
+
+1. **State-Future prediction in System 2**
+   - `query_ca`: a cross-attention decoder that predicts a sequence of future states.
+   - `mean_pool`: the earlier MLP/mean-pool path, retained for checkpoint compatibility.
+   - SF parameters are written into the checkpoint configuration, so `from_pretrained` can reconstruct the model without manual flags.
+
+2. **Optional SF feedback to System 1**
+   - `feed_state_future_to_dit=True` appends predicted future-state tokens to the System-1 bridge pack.
+   - `sf_dit_repr` selects the predicted state (`shat`) or a decoder hidden representation (`mid_hidden`).
+
+3. **Optional MoT System 1**
+   - `use_mot_system1=True` switches the dense DiT action expert to a Mixture-of-Transformers variant with modality-specific QKV, output projections, FFNs, and layer norms.
+   - The default is still the dense DiT path.
+
+The repository also contains the engineering work needed to run these variants: data transforms, checkpoint/config plumbing, training entry points, evaluation services, and smoke tests.
+
+---
+
+## Architecture
+
+```text
+images (front / wrist), language, proprioception
+                         |
+                System-2 VLM backbone
+                  /                 \
+          bridge tokens        State-Future decoder
+                  |             (query_ca / mean_pool)
+                  |                    |
+                  |          optional SF-to-System-1
+                  |                    |
+                  +--------> System-1 action expert
+                                     |
+                              action chunk
+```
+
+### Dual-system policy
+
+- The VLM backbone processes visual observations and language instructions.
+- The bridge branch learns a latent representation aligned with a future goal frame.
+- The action expert consumes bridge tokens and predicts a chunk of robot actions.
+- The action expert can be a dense DiT or the optional MoT DiT.
+
+### State-Future head
+
+- Predicts future end-effector state over the action horizon.
+- Supports full-state and wrist-only variants.
+- Uses frame and dimension masks for padded trajectory tails.
+- Can be trained as an auxiliary loss or fed back into System 1.
+
+### MoT option
+
+- `MoTDiT`, `MoTTransformerBlock`, and `MoTGlobalSelfAttention` are implemented in the action-head code.
+- Modalities are `vis`, `sf`, and `act`.
+- The dense path remains the reference configuration.
+
+### Training objective
+
+```text
+L = action_loss + bridge_weight * bridge_loss + sf_weight * state_future_loss
+```
+
+- `loss_combine_mode=additive` is the default.
+- `legacy_avg` is retained for comparison.
+- The bridge loss can be disabled for action-only fine-tuning.
+- The SF loss is optional and is usually enabled only for SF experiments.
+
+---
+
+## Status
+
+| Area | Status |
+|---|---|
+| 24-task GR1/RoboCasa-style training pipeline | Available; research recipe |
+| Dense System-1 + bridge / world-model | Available |
+| State-Future with `query_ca` or `mean_pool` | Available |
+| SF-to-System-1 feedback | Available; optional |
+| MoT System-1 | Available; experimental |
+| GR1 simulation evaluation | Available; environment setup required |
+| LIBERO-plus integration | Experimental; not a supported benchmark yet |
+| Public pretrained checkpoints | Download script provided for released DIAL checkpoints |
+| Datasets | Not included; download/preprocess scripts provided |
+
+### Reference result (internal, not a controlled benchmark)
+
+A 36-layer mean-pool SF 20k recipe reached approximately **61.8%** success in internal GR1 simulation logs. This number is a reference point for reproduction, not a claim of state-of-the-art performance. Re-run the scripts in your environment before citing it.
+
+### LIBERO-plus note
+
+The LIBERO-plus branch is included for transparency and continued research. Current transfer pilots from the GR1/RoboCasa 20k checkpoint are not reliable; the action head and action-interface mismatch are under investigation. See `DIAL-LIBERO-PLUS/` for code links, interface checks, and the failure analysis. Do not treat current LIBERO-plus numbers as benchmark results.
+
+---
+
+## Repository Layout
+
+```text
+.
+├── gr00t/
+│   ├── model/                 # VLM backbone, DiT/MoT action heads, policy, transforms
+│   ├── experiment/            # training loop, data configs, trainer
+│   ├── data/                  # LeRobot datasets, transforms, embodiment tags
+│   ├── eval/                  # observation/action adapters
+│   └── rlvr/                  # optional RLVR utilities
+├── scripts/
+│   ├── dual_system_train.py   # main training entry point
+│   ├── inference_service_dial.py
+│   ├── simulation_service_dial_augPosRot.py
+│   ├── eval_policy_dial.py
+│   ├── compute_success_rate.py
+│   ├── run_24task_*.sh        # 24-task training recipes
+│   ├── run_mot_*.sh           # MoT recipes
+│   ├── run_libero_*.sh        # LIBERO-plus experimental pipeline
+│   └── preprocess_*.sh        # dataset preparation
+├── preprocessing/             # HDF5/LeRobot preprocessing utilities
+├── examples/                  # shell entry points and task lists
+├── detach_verification/       # SF gradient-detach ablations and patches
+├── DIAL-LIBERO-PLUS/          # LIBERO-plus documentation and code snapshot
+├── docs/                      # design notes
+└── launch/ probe/ rlvr/       # experiment utilities on the public branch
+```
+
+`outputs/`, `runs/`, checkpoints, raw datasets, and generated logs are intentionally not part of the source tree. The provided scripts create them under configurable external roots.
+
+---
+
+## Installation
+
+### Requirements
+
+- Linux
+- NVIDIA GPU; 48 GB is recommended for full `--tune-llm` training
+- CUDA 12.1-compatible PyTorch (the setup script uses PyTorch 2.5.1 / torchvision 0.20.1)
+- Conda or Miniconda
+- Python 3.10 (recommended)
+- Optional: FlashAttention for faster training
+- Optional: a second environment for LIBERO-plus evaluation
+
+### Setup
 
 ```bash
-git diff --stat 986a7dd HEAD          # 总览
-git diff 986a7dd HEAD -- gr00t/       # 模型/数据代码差异
+git clone https://github.com/weibinlee2024/DAIL02_SF.git
+cd DAIL02_SF
+
+conda create -n dial python=3.10 -y
+conda activate dial
+
+# The installer assumes the conda environment is already named "dial".
+bash scripts/install_dial_env.sh
+
+# This repository is used as a source tree.
+export PYTHONPATH="$PWD:$PYTHONPATH"
 ```
 
-## 1. 差异总览
+If the installer's editable-install step is unavailable in your checkout, skip it and keep the source tree on `PYTHONPATH`:
 
-| 类型 | 数量 | 说明 |
-|---|---:|---|
-| 修改 Modified | 12 | 模型 / 数据 / 训练 / 脚本，合计 **+1020 / -114** 行 |
-| 新增 Added | 12 | 本 README、`MANIFEST.txt`、`.gitignore` + 9 个脚本 |
-| 删除 Deleted | 74 | 39 个历史脚本 + 35 个被纳入版本管理的 `.pyc` |
+```bash
+export PYTHONPATH="$PWD:$PYTHONPATH"
+python -c "import gr00t; print(gr00t.__file__)"
+```
 
-> 删除的 `docs/` 6 个文件相对基线属于"新增后又删除"，净差异为零，不列入上表。
+FlashAttention is optional. If it is not available, use the non-flash-attention configuration supported by the model.
 
-## 2. 功能差异（相对基线）
+### External storage
 
-### 2.1 System-2 状态未来：MLP mean-pool → `query_ca` 跨注意力解码器
+The provided helper links `data/`, `checkpoints/`, and `outputs/` to an external directory:
 
-- 基线：`state_future_projector`（MLP + mean-pool，常配 `D_sf=128`），仅作辅助损失。
-- 现在：默认 `StateFutureDecoder`（`state_future_decoder=query_ca`，跨注意力查询未来帧），输出形状 `[B, 17, 30]`；`mean_pool` 路径仍可选。
-- 预测视野 = `action_horizon`（17 帧）；`state_future_wrist_only=True` 时维度降为 18。
-- SF 相关配置随 checkpoint 写入 `bridge_cfg`，`from_pretrained` 可自描述重建：
-  `use_state_future`、`compute_state_future_loss`、`state_future_loss_weight`、`state_future_horizon`、
-  `tune_state_future_projector`、`state_future_decoder`、`state_future_dim`、`state_future_num_heads`。
+```bash
+export DIAL_EXT_ROOT=/path/to/large/disk
+bash scripts/setup_local_paths.sh
+```
 
-### 2.2 可选：把 Ŝ 回灌 System-1（`feed_state_future_to_dit`）
+The helper requires those target names not to exist as regular directories. Move existing data aside before linking.
 
-- 新增 `state_future_to_cond`（含 type embedding），把 17 个未来状态 token 追加到 bridge pack：
-  `[goal | obs | sf]`。
-- `sf_dit_repr` 可选 `shat`（预测未来状态）或 `mid_hidden`（解码器中间隐层）。
+---
 
-### 2.3 可选：MoT System-1（`vis | sf | act`）
+## Data Preparation
 
-- 新增 `MoTDiT`、`MoTTransformerBlock`、`MoTGlobalSelfAttention`：模态私有 QKV / WO / FFN / LN，共享全局自注意力。
-- 由 `flow_matching_action_head_dial.py` 的 `_split_vis_sf`、`_build_mot_sequence` 组装序列。
-- 默认 `use_mot_system1=False`，Dense DiT 路径与基线一致。
+Datasets and pretrained checkpoints are not redistributed in this repository.
 
-### 2.4 损失合成
+### GR1 / RoboCasa-style teleoperation data
+
+```bash
+# Download the NVIDIA PhysicalAI GR00T Teleop Sim package.
+bash scripts/download_gr1_raw.sh
+
+# Preprocess the 24-task GR1 dataset.
+bash scripts/preprocess_gr1_all_tasks.sh
+```
+
+The raw package is large. The download script writes to `data/raw/` (or the external root configured by `setup_local_paths.sh`).
+
+The 24-task training scripts expect a list of LeRobot task directories. Review each script and set the dataset root/path variables for your machine. For example:
+
+```bash
+DATA_ROOT=/path/to/lerobot/tasks
+OUTPUT_DIR=/path/to/outputs/24task_sf
+```
+
+### LIBERO-plus data (experimental)
+
+The LIBERO-plus pipeline uses LeRobot datasets and the `libero-plus` environment:
+
+```bash
+bash scripts/preprocess_libero_dense_all.sh
+python scripts/prepare_libero_plus_lerobot.py --help
+python scripts/build_libero_plus_heldout_manifest.py --help
+```
+
+LIBERO-plus videos are AV1 encoded. Use the `torchvision_av` backend (or another AV1-capable decoder); `decord` does not handle these files.
+
+### Expected data conventions
+
+- LeRobot v2.1-style datasets with images, language annotations, state, and action keys.
+- Data configs live in `gr00t/experiment/data_config_dial.py`.
+- Normalization statistics must come from the target dataset. Do not reuse GR1 metadata for a new embodiment.
+- Keep `action_horizon` consistent with the checkpoint unless you intentionally rebuild the action head.
+
+---
+
+## Training
+
+### Two-stage bridge recipe
+
+The main recipe follows the DIAL two-stage pattern:
+
+1. **Golden / decoupled stage**: learn the bridge/world-model representation.
+2. **End-to-end stage**: fine-tune the full policy with the action loss and optional bridge/SF losses.
+
+Common wrappers:
+
+```bash
+# Stage 1: 24-task SF golden 20k
+bash scripts/run_24task_pretrain_golden_sf_tune_llm_20k.sh
+
+# Stage 2: 24-task SF end-to-end 10k
+bash scripts/run_24task_finetune_end2end_sf_tune_llm_test.sh
+
+# Both stages
+bash scripts/run_24task_sf_tune_llm_pipeline.sh
+```
+
+MoT recipe:
+
+```bash
+bash scripts/run_mot_aligned_20k_pipeline.sh
+```
+
+Single-GPU SF recipes:
+
+```bash
+bash scripts/run_1gpu_pretrain_sf_80k.sh
+bash scripts/run_1gpu_finetune_sf_80k.sh
+```
+
+The generic wrapper maps the stage name to `--bridge_type`:
+
+```bash
+bash examples/train.sh decoupled [training arguments]
+bash examples/train.sh end2end  [training arguments]
+```
+
+### Minimal direct training command
+
+```bash
+python -u scripts/dual_system_train.py \
+  --bridge_type golden \
+  --dataset-path /path/to/lerobot/task_a /path/to/lerobot/task_b \
+  --data-config fourier_gr1_arms_waist_aug_pos_rot_flip_wrist_only_gausNorm_crop_sf128 \
+  --embodiment_tag gr1 \
+  --base_model_path /path/to/base/checkpoint \
+  --output_dir /path/to/output \
+  --num-gpus 1 \
+  --batch-size 2 \
+  --gradient-accumulation-steps 32 \
+  --max-steps 20000 \
+  --save-steps 1000 \
+  --tune-llm \
+  --no-tune-visual \
+  --tune-projector \
+  --tune-diffusion-model \
+  --select_layer 36 \
+  --use-state-future \
+  --compute-state-future-loss \
+  --state-future-decoder mean_pool \
+  --state-future-dim 128 \
+  --state-future-horizon 16 \
+  --state-future-loss-weight 0.5 \
+  --compute-bridge-loss \
+  --use-separate-projector-for-loss
+```
+
+The exact task list, base checkpoint, and output paths are machine-specific. Review the shell recipes before launching; they are intended as reproducible starting points rather than portable one-click scripts.
+
+### Effective batch size
+
+`--batch-size` and `--gradient-accumulation-steps` determine the effective batch:
 
 ```text
-L = action_loss + bridge_w * bridge_loss + w * state_future_loss   # loss_combine_mode=additive（默认）
+effective_batch = batch_size * gradient_accumulation_steps * num_gpus
 ```
 
-- 备选 `legacy_avg`；CLI 默认 `state_future_loss_weight=1.0`，对齐 / MoT 实验常用 `w=0.05`。
-- SF 梯度默认不 detach，可回灌 decoder → bridge / VLM（`--tune-llm` 时）。
+The 24-task recipes typically use an effective batch of 64. When comparing runs, compare effective samples/steps, not only the nominal step count.
 
-### 2.5 数据管线与 transforms
+### Memory guidance
 
-- `data_config_dial.py`：新增 `state_future` modality、`DEFAULT_STATE_FUTURE_KEYS`、`get_state_future_dim()` / `get_state_future_concat_order()`，按需构建 SF pipeline。
-- `dataset.py`：生成 `state_future_time_mask`（轨迹尾部 pad 帧）。
-- `transforms.py`：`_prepare_state_future` 输出 `state_future` / `state_future_mask`，帧 mask 与维度 mask 合并；缺少 SF key 时 fail-fast。
-- `concat.py`：`torch.as_tensor` 兼容非 tensor 输入，避免 `.clone()` 崩溃。
-- `vlm_backbone_dial.py`：打印 backbone 可训练参数量（`n_train / n_total`）。
+For a 48 GB GPU with full `--tune-llm` training:
 
-### 2.6 训练 / 工程修复
+- use `MODEL_BF16=1` when the recipe supports it;
+- keep `--no-tune-visual`;
+- reduce `batch_size` and increase gradient accumulation;
+- enable gradient checkpointing;
+- do not enable extra losses until the baseline action-only run is stable.
 
-- `trainer.py`：AdamW 默认 `foreach=False`，修复 48GB 显卡 + `--tune-llm` 时首步 `_foreach_sqrt` 大临时张量 OOM。
-- `run_1gpu_finetune_sf_80k.sh`：SF 80k 微调改为 `--tune-llm`，`bs=2 × accum=32`（有效 batch 64），独立输出目录。
+---
 
-## 3. 修改文件明细（12）
+## Evaluation
 
-| 文件 | 行数 | 变更 |
-|---|---:|---|
-| `gr00t/model/gr00t_n1_dial.py` | +433 / -60 | `StateFutureDecoder`（`query_ca`）、`state_future_to_cond` 回灌、MoT 接线、`loss_combine_mode`、SF 配置写入 ckpt |
-| `gr00t/model/action_head/cross_attention_dit.py` | +253 / -0 | 新增 `MoTDiT` / `MoTTransformerBlock` / `MoTGlobalSelfAttention` |
-| `gr00t/model/action_head/flow_matching_action_head_dial.py` | +113 / -15 | `_split_vis_sf`、`_build_mot_sequence`，SF token 加入 DiT 序列 |
-| `gr00t/experiment/data_config_dial.py` | +77 / -12 | SF modality 定义、维度 / 拼接顺序、pipeline 构建 |
-| `scripts/dual_system_train.py` | +42 / -1 | SF / MoT / feed 全量 CLI 接线与 data_config 开关 |
-| `gr00t/model/transforms.py` | +39 / -16 | `_prepare_state_future`、`state_future(_mask)`、缺 key fail-fast |
-| `gr00t/data/dataset.py` | +24 / -0 | `state_future_time_mask`（尾部 pad 帧） |
-| `gr00t/data/transform/concat.py` | +13 / -3 | `torch.as_tensor` 健壮性修复 |
-| `gr00t/model/configs/gr00t_n1.5_dial_augPosRot.json` | +10 / -1 | 新增 SF / MoT 默认字段（见 §6） |
-| `scripts/run_1gpu_finetune_sf_80k.sh` | +8 / -6 | SF 80k 微调切到 tune-llm |
-| `gr00t/experiment/trainer.py` | +5 / -0 | AdamW `foreach=False`，修复 tune-llm 首步 OOM |
-| `gr00t/model/backbone/vlm_backbone_dial.py` | +3 / -0 | 打印可训练参数规模 |
+### In-distribution and OOD GR1 simulation
 
-## 4. 新增文件明细（12）
+`examples/eval.sh` launches the policy server and the simulation client for the GR1 task sets:
 
-| 文件 | 行数 | 用途 |
-|---|---:|---|
-| `README.md` | — | 本文档：与 `DIAL02-main` 的完整差异说明 |
-| `MANIFEST.txt` | 25 | 打包快照文件清单 |
-| `.gitignore` | 11 | 忽略 `__pycache__/`、`*.py[cod]`、`outputs/`、`checkpoints/`、`runs/`、`*.log` 等 |
-| `scripts/verify_state_future_fixes.py` | +289 | CPU 校验：mask 合并、decoder 形状、配置写回与加载 |
-| `scripts/smoke_feed_sf_to_dit.py` | +82 | 回灌冒烟：17 个 SF token 进入 bridge pack |
-| `scripts/diag_sf_per_frame_and_probe.py` | +335 | 逐帧 SF 损失 + 冻结表征线性探针诊断 |
-| `scripts/run_mot_vs_dense_aligned_2k.sh` | +131 | Dense+Ŝ vs MoT 对齐 2k 对照（`SMOKE_STEPS=5` 可冒烟） |
-| `scripts/run_sf_dual_channel_2k.sh` | +94 | `feed_state_future_to_dit` 双通道 2k |
-| `scripts/run_mot_aligned_20k_pipeline.sh` | +194 | 24-task MoT：golden 20k → end2end 10k |
-| `scripts/run_24task_pretrain_golden_sf_tune_llm_20k.sh` | +90 | 24-task SF golden 20k（`--tune-llm`） |
-| `scripts/run_24task_finetune_end2end_sf_tune_llm_test.sh` | +89 | 24-task SF end2end 10k 验证 |
-| `scripts/run_24task_sf_tune_llm_pipeline.sh` | +52 | 上述两个 24-task 脚本的流水线封装 |
-
-## 5. 删除文件明细（74）
-
-### 5.1 历史脚本（39 个）
-
-| 类别 | 数量 | 代表文件 |
-|---|---:|---|
-| 4GPU / 4task | 6 | `run_4task_*_4gpu.sh`、`run_4task_*_end2end.sh`、`run_4task_pretrain_golden.sh` |
-| 多机 / DDP 调试 | 12 | `run_2card_pretrain_*.sh`、`run_local/remote_{ddp,pretrain_ddp}*.sh`、`torchrun_smoke_*.sh`、`diag_nosync_*`、`diag2.py` |
-| 中继 / 监控 / 状态 | 5 | `relay_eval.sh`、`relay_single.sh`、`status_repro.sh`、`monitor_libero_train.{py,sh}` |
-| 一次性排查 / 修复 | 5 | `check_eval_tasks.py`、`check_ood_tasks.py`、`test_robocasa_{env,viz}.py`、`fix_episode_701.py` |
-| 被取代的 1GPU | 9 | `run_1gpu_{finetune,pretrain}_{sim,single}*.sh`、`run_1gpu_{smoke_train,libero_*}.sh`、`env_1gpu.sh` |
-| 其它 | 2 | `test_mem_bs2.sh`、`watch_sf.sh`（写死本机路径） |
-
-<details>
-<summary>展开完整 39 个删除脚本</summary>
-
-```text
-scripts/check_eval_tasks.py
-scripts/check_ood_tasks.py
-scripts/diag2.py
-scripts/diag_nosync.py
-scripts/diag_nosync_local.sh
-scripts/diag_nosync_remote.sh
-scripts/env_1gpu.sh
-scripts/fix_episode_701.py
-scripts/monitor_libero_train.py
-scripts/monitor_libero_train.sh
-scripts/relay_eval.sh
-scripts/relay_single.sh
-scripts/run_1gpu_finetune_sim.sh
-scripts/run_1gpu_finetune_single.sh
-scripts/run_1gpu_libero_pretrain.sh
-scripts/run_1gpu_libero_smoke_train.sh
-scripts/run_1gpu_pretrain_sim.sh
-scripts/run_1gpu_pretrain_single.sh
-scripts/run_1gpu_pretrain_single_80k.sh
-scripts/run_1gpu_smoke_train.sh
-scripts/run_2card_pretrain_local.sh
-scripts/run_2card_pretrain_remote.sh
-scripts/run_4task_finetune_end2end.sh
-scripts/run_4task_finetune_end2end_4gpu.sh
-scripts/run_4task_finetune_end2end_sf_4gpu.sh
-scripts/run_4task_pretrain_golden.sh
-scripts/run_4task_pretrain_golden_4gpu.sh
-scripts/run_4task_pretrain_golden_sf_4gpu.sh
-scripts/run_local_ddp0.sh
-scripts/run_local_pretrain_ddp.sh
-scripts/run_remote_ddp1.sh
-scripts/run_remote_pretrain_ddp.sh
-scripts/status_repro.sh
-scripts/test_mem_bs2.sh
-scripts/test_robocasa_env.py
-scripts/test_robocasa_viz.py
-scripts/torchrun_smoke_local.sh
-scripts/torchrun_smoke_remote.sh
-scripts/watch_sf.sh
+```bash
+bash examples/eval.sh /path/to/checkpoint id
+bash examples/eval.sh /path/to/checkpoint ood_object_appearance
+bash examples/eval.sh /path/to/checkpoint ood_container_combination
+bash examples/eval.sh /path/to/checkpoint ood_object_type
 ```
 
-</details>
+The script uses local RoboCasa/robosuite paths and a local conda environment. Update those paths for your machine before running.
 
-### 5.2 版本库清理
+Useful components:
 
-- 删除 35 个被基线纳入版本管理的 `gr00t/**/__pycache__/*.pyc`。
-- 新增根目录 `.gitignore`，避免再次提交字节码 / 训练产物。
+```bash
+# Policy server only
+python scripts/inference_service_dial.py \
+  --server \
+  --model_path /path/to/checkpoint \
+  --embodiment_tag gr1 \
+  --data_config fourier_gr1_arms_waist_aug_pos_rot_flip_wrist_only_gausNorm_crop \
+  --port 5555
 
-## 6. CLI 与配置新增项
+# Offline dataset evaluation
+python scripts/eval_policy_dial.py \
+  --dataset-path /path/to/lerobot/tasks \
+  --model-path /path/to/checkpoint \
+  --data-config fourier_gr1_arms_waist_aug_pos_rot_flip_wrist_only_gausNorm_crop \
+  --embodiment-tag gr1 \
+  --video-backend torchvision_av
 
-`gr00t/model/configs/gr00t_n1.5_dial_augPosRot.json` 与 `dual_system_train.py` 新增：
+# Aggregate success rates
+python scripts/compute_success_rate.py --help
+```
 
-| 开关 | 默认 | 含义 |
+### LIBERO-plus (experimental)
+
+The manifest-based evaluation path is:
+
+```bash
+MODEL_PATH=/path/to/checkpoint \
+MANIFEST=/path/to/pilot_v1.json \
+OUT=/path/to/eval_output \
+PORT=5582 \
+CUDA_DEVICE=1 \
+  bash scripts/run_libero_plus_manifest_eval.sh
+```
+
+Use the `libero-plus` Python environment and OSMesa for headless rendering. The current LIBERO-plus transfer results are experimental; the `DIAL-LIBERO-PLUS/` package contains the interface checks, pilot results, and failure analysis.
+
+---
+
+## Checkpoints
+
+Download the released DIAL checkpoints:
+
+```bash
+bash scripts/download_checkpoints.sh fewshot
+bash scripts/download_checkpoints.sh fulldata
+bash scripts/download_checkpoints.sh both
+```
+
+The script uses `xpeng-robotics/DIAL_checkpoints` on Hugging Face and writes under `checkpoints/`.
+
+Checkpoint loading notes:
+
+- The checkpoint configuration is authoritative for `select_layer`, action horizon, SF decoder, and embodiment settings.
+- Do not force a different `select_layer` from the one used during pretraining.
+- `bridge_goal_model.*` may be absent from shared-bridge checkpoints by design; this is expected for inference-only use.
+- Do not enable bridge loss with a randomly initialized goal encoder unless you intentionally want a random-target ablation.
+- Prefer a weight-loading check that reports missing/unexpected keys. Silent fallback to random initialization is a common source of invalid experiments.
+
+---
+
+## Configuration Reference
+
+Key training and model flags:
+
+| Flag | Default | Description |
 |---|---|---|
-| `use_state_future` / `--use-state-future` | `false` | 启用状态未来监督 |
-| `compute_state_future_loss` / `--compute-state-future-loss` | `false` | 计算 SF 损失 |
-| `state_future_loss_weight` | `1.0` | SF 损失权重（对齐 / MoT 实验常用 `0.05`） |
-| `state_future_horizon` | `null` → `action_horizon`(17) | 预测帧数 |
-| `state_future_decoder` | `query_ca` | `query_ca` \| `mean_pool` |
-| `state_future_dim` | `30`（wrist-only 为 18） | SF 标签维度 |
-| `state_future_num_heads` | `8` | query_ca 注意力头数 |
-| `state_future_wrist_only` / `--state-future-wrist-only` | `false` | 仅监督手腕状态 |
-| `tune_state_future_projector` | `true` | decoder / 投影参与训练 |
-| `loss_combine_mode` | `additive` | `additive` \| `legacy_avg` |
-| `feed_state_future_to_dit` / `--feed-state-future-to-dit` | `false` | Ŝ 回灌 System-1 |
-| `sf_dit_repr` | `shat` | `shat` \| `mid_hidden` |
-| `use_mot_system1` / `--use-mot-system1` | `false` | Dense → MoT |
-| `mot_include_sf` / `--mot-include-sf` | `true` | MoT 是否包含 SF 模态 |
-| `mot_sf_num_tokens` / `--mot-sf-num-tokens` | `17` | SF token 数 |
-| `mot_num_layers` / `--mot-num-layers` | `null` | MoT 层数（默认沿用 DiT 配置） |
+| `--bridge_type` | `golden` in examples | `golden` (stage 1) or `end2end` (stage 2) |
+| `--compute-bridge-loss` | off | Enable bridge/world-model loss |
+| `--use-separate-projector-for-loss` | off | Use a separate bridge loss projector |
+| `--use-state-future` | off | Enable state-future data/model path |
+| `--compute-state-future-loss` | off | Add the SF loss |
+| `--state-future-loss-weight` | `1.0` | SF loss weight; experiments often use `0.05` |
+| `--state-future-decoder` | `query_ca` | `query_ca` or `mean_pool` |
+| `--state-future-dim` | model/config | SF label width |
+| `--state-future-horizon` | action horizon | Number of future frames |
+| `--state-future-num-heads` | `8` | `query_ca` attention heads |
+| `--state-future-wrist-only` | off | Restrict SF to wrist state |
+| `--feed-state-future-to-dit` | off | Feed predicted SF tokens into System 1 |
+| `--sf-dit-repr` | `shat` | `shat` or `mid_hidden` |
+| `--use-mot-system1` | off | Enable MoT System 1 |
+| `--mot-include-sf` | on | Include SF modality in MoT |
+| `--mot-sf-num-tokens` | `17` | Number of SF tokens |
+| `--mot-num-layers` | model/config | MoT layer count |
+| `--loss-combine-mode` | `additive` | `additive` or `legacy_avg` |
+| `--select_layer` | model/config | VLM layer used by the action expert |
+| `--unified-embodiment-tag` | model/config | Shared action-head category |
+| `--tune-llm` | off | Train the language-model backbone |
+| `--tune-diffusion-model` | off | Train the action expert |
+| `--no-tune-visual` | off | Freeze the visual encoder |
 
-## 7. 验证与训练入口
+The public code supports both `query_ca` and `mean_pool` SF decoders. The 36-layer mean-pool SF recipe uses `mean_pool`; check the checkpoint configuration before overriding it.
+
+---
+
+## Verification and Smoke Tests
+
+Run these before a long training job:
 
 ```bash
-# CPU 校验（mask / decoder / 配置写回）
+# CPU checks for SF masks, decoder shapes, and config round-trip
 python scripts/verify_state_future_fixes.py
 
-# 回灌冒烟（17 个 SF token 进入 bridge pack）
+# SF-to-System-1 smoke test
 python scripts/smoke_feed_sf_to_dit.py
 
-# 短训冒烟
+# MoT smoke tests
+python scripts/smoke_mot_system1.py
+python scripts/smoke_mot_cond_experts.py
+
+# Short training smoke runs
 SMOKE_STEPS=5 bash scripts/run_sf_dual_channel_2k.sh
 SMOKE_STEPS=5 RUN_WHICH=mot bash scripts/run_mot_vs_dense_aligned_2k.sh
-
-# 正式训练
-bash scripts/run_24task_sf_tune_llm_pipeline.sh     # 24-task SF: 20k → 10k
-bash scripts/run_mot_aligned_20k_pipeline.sh        # 24-task MoT: 20k → 10k
-bash scripts/run_1gpu_pretrain_sf_80k.sh            # SF 80k 预训练
-bash scripts/run_1gpu_finetune_sf_80k.sh            # SF 80k 微调（tune-llm）
 ```
 
-## 8. 目录与脚本现状
+For SF diagnostics:
 
-保留的 `scripts/` 共 27 个文件，按用途：
+```bash
+python scripts/diag_sf_per_frame_and_probe.py --help
+python scripts/diag_sf_probe_normalized.py --help
+```
 
-- **核心训练 / 评测**：`dual_system_train.py`、`eval_policy_dial.py`、`inference_service_dial.py`、`simulation_service_dial_augPosRot.py`、`smoke_load_model.sh`、`compute_success_rate.py`
-- **SF / MoT 实验**：`run_24task_*`、`run_mot_*`、`run_sf_dual_channel_2k.sh`、`run_1gpu_{pre,finetune}_sf_80k.sh`、`diag_sf_per_frame_and_probe.py`、`smoke_feed_sf_to_dit.py`、`verify_state_future_fixes.py`
-- **数据 / 环境**：`install_dial_env.sh`、`setup_local_paths.sh`、`download_checkpoints.sh`、`download_gr1_raw.sh`、`preprocess_gr1_*.sh`、`preprocess_libero_dense_*.sh`
+---
+
+## Relationship to DIAL02
+
+This repository is a research fork of **DIAL02**.
+
+- Baseline: [weibinlee2024/DIAL02](https://github.com/weibinlee2024/DIAL02) at commit `986a7dd`.
+- This branch: SF decoder, optional SF feedback, optional MoT, data/config plumbing, and experiment scripts.
+
+If the baseline commit is present in your checkout, inspect the delta with:
+
+```bash
+git diff --stat 986a7dd HEAD
+git diff 986a7dd HEAD -- gr00t/
+```
+
+Major changes:
+
+| Area | Change |
+|---|---|
+| System-2 SF | `StateFutureDecoder` with `query_ca`; `mean_pool` retained |
+| SF-to-System-1 | `state_future_to_cond` and `feed_state_future_to_dit` |
+| System-1 | Optional `MoTDiT` / `MoTTransformerBlock` |
+| Losses | Additive and `legacy_avg` combination modes |
+| Data | `state_future` modality, masks, padding, and transforms |
+| Training | SF/MoT CLI plumbing and checkpoint config persistence |
+| Engineering | AdamW `foreach=False` OOM fix and trainable-parameter logging |
+| Cleanup | Removed stale experiment scripts and versioned bytecode |
+
+The complete change history relative to the baseline remains available in Git.
+
+---
+
+## Troubleshooting
+
+### The installer cannot find packaging metadata
+
+This is a source checkout. If `pip install -e .` is unavailable, skip the editable install and add the repository root to `PYTHONPATH`:
+
+```bash
+export PYTHONPATH="$PWD:$PYTHONPATH"
+```
+
+### OOM during full fine-tuning
+
+- Use `MODEL_BF16=1` when supported.
+- Reduce micro-batch size and increase gradient accumulation.
+- Keep the visual encoder frozen.
+- Enable gradient checkpointing.
+- Use the `AdamW(foreach=False)` behavior implemented in `gr00t/experiment/trainer.py`.
+
+### Video decoding fails on LIBERO-plus
+
+LIBERO-plus videos are AV1. Use `torchvision_av`/PyAV; `decord` is not sufficient for these files.
+
+### `bridge_goal_model` missing-weight warning
+
+Shared bridge checkpoints intentionally omit duplicated `bridge_goal_model` weights. This is expected for inference. If you train with `--compute-bridge-loss`, make sure the goal encoder is trained or intentionally frozen; otherwise the bridge loss target is random.
+
+### Checkpoint config mismatch
+
+If `select_layer`, action horizon, SF decoder, or embodiment tag does not match the checkpoint, the loader may warn or rebuild modules. Use the checkpoint configuration and avoid silent `ignore_mismatched_sizes` fallbacks in training.
+
+### Hard-coded local paths
+
+Some experiment scripts and `examples/eval.sh` contain local paths from the development machine. Replace them with your dataset, checkpoint, RoboCasa, robosuite, and conda paths before running.
+
+### LIBERO-plus action saturation
+
+The LIBERO-plus branch is experimental. The documented pilot analysis found severe action saturation and a GR1-to-LIBERO action-head mismatch. Treat those runs as debugging experiments, not benchmark results.
+
+---
+
+## License and Acknowledgements
+
+The source files retain their upstream SPDX headers, including Apache-2.0 notices where applicable. Upstream components, datasets, and checkpoints keep their original licenses and terms.
+
+This work builds on:
+
+- **DIAL02**: the dual-system policy baseline.
+- **NVIDIA Isaac GR00T N1.5**: the robot foundation-model stack.
+- **RoboCasa / GR1 tabletop environments** for simulation data and evaluation.
+- **LIBERO-plus** for the experimental lifelong manipulation benchmark.
+
+Datasets and pretrained checkpoints are not redistributed by this repository. Please follow the upstream licenses when downloading or using them.
+
+---
+
+## Contact
+
+For questions, bug reports, or reproduction notes, open an issue in the public repository:
+
+https://github.com/weibinlee2024/DAIL02_SF
+
+When reporting a training or evaluation issue, include the commit, checkpoint path, data config, `select_layer`, effective batch, GPU type, and the exact command used.
