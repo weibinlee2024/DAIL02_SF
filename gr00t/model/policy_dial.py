@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
+import gzip
 import json
+import os
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -30,6 +34,19 @@ from gr00t.data.transform.base import ComposedModalityTransform
 from gr00t.model.gr00t_n1_dial import GR00T_N1_5_DIAL
 
 COMPUTE_DTYPE = torch.bfloat16
+
+
+@contextmanager
+def _preserve_torch_rng():
+    """Allow per-candidate seeding without leaking global RNG state."""
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
 
 
 def _confirm_loaded_weights(model, model_path) -> None:
@@ -131,6 +148,11 @@ class DialPolicy(BasePolicy):
         bon_k: int = 1,
         bon_seed: int = 0,
         bon_select: str = "score",
+        wm_score_frame_end: Optional[int] = None,
+        door_ckpt: Optional[str] = None,
+        door_lambda: float = 0.0,
+        bon_stage_mode: str = "off",
+        bon_object_lambda: float = 0.0,
     ):
         """
         Initialize the DialPolicy.
@@ -148,6 +170,12 @@ class DialPolicy(BasePolicy):
             bon_k: Number of action candidates to sample (1 = no BoN).
             bon_seed: Base seed for candidate resampling.
             bon_select: How to pick among K candidates — score (WM) | random.
+            wm_score_frame_end: Exclusive end index for WM score window (default 9 → t+1..t+8).
+                Set 17 to score the full foresight horizon (plan ④).
+            door_ckpt: Optional door-dynamics .pt for hybrid Close scoring.
+            door_lambda: Weight on door-close term (0 disables).
+            bon_stage_mode: off | auto | grasp | placement | close (plan ④).
+            bon_object_lambda: Weight on object-attract term for grasp/placement.
         """
         try:
             # NOTE(YL) this returns the local path to the model which is normally
@@ -204,8 +232,15 @@ class DialPolicy(BasePolicy):
         self.bon_k = max(int(bon_k), 1)
         self.bon_seed = int(bon_seed)
         self.bon_select = (bon_select or "score").strip().lower()
-        if self.bon_select not in ("score", "random"):
-            raise ValueError(f"bon_select must be score|random, got {self.bon_select!r}")
+        if self.bon_select not in ("score", "random", "fixed0"):
+            raise ValueError(
+                f"bon_select must be score|random|fixed0, got {self.bon_select!r}"
+            )
+        self.wm_score_frame_end = wm_score_frame_end
+        self._bon_diag_path = os.environ.get("BON_DIAG_LOG", "").strip()
+        if self._bon_diag_path:
+            Path(self._bon_diag_path).parent.mkdir(parents=True, exist_ok=True)
+            print(f"[DialPolicy] BoN diagnostics -> {self._bon_diag_path}", flush=True)
         self._bon_call_idx = 0
         self._wm_bon = None
         if wm_ckpt:
@@ -216,9 +251,17 @@ class DialPolicy(BasePolicy):
                 policy_metadata=self.metadata,
                 device=self.device,
                 bon_k=self.bon_k,
+                score_frame_end=wm_score_frame_end,
+                door_ckpt=door_ckpt,
+                door_lambda=door_lambda,
+                stage_mode=bon_stage_mode,
+                object_lambda=bon_object_lambda,
             )
             print(
-                f"[DialPolicy] WM-BoN enabled k={self.bon_k} select={self.bon_select} ckpt={wm_ckpt}",
+                f"[DialPolicy] WM-BoN enabled k={self.bon_k} select={self.bon_select} "
+                f"score_frame_end={getattr(self._wm_bon, 'score_frame_end', None)} "
+                f"stage={bon_stage_mode} obj_λ={bon_object_lambda} door_λ={door_lambda} "
+                f"ckpt={wm_ckpt}",
                 flush=True,
             )
         elif self.bon_k > 1 and self.bon_select == "score":
@@ -228,6 +271,7 @@ class DialPolicy(BasePolicy):
                 f"[DialPolicy] BoN sampling k={self.bon_k} select={self.bon_select} (no WM)",
                 flush=True,
             )
+        self._bon_ctx: Dict[str, Any] = {}
 
     def set_sf_eval_mode(self, mode: str = "correct", bank_max: int | None = None) -> None:
         """Proxy to GR00T_N1_5_DIAL.set_sf_eval_mode for online-SR arms."""
@@ -288,6 +332,12 @@ class DialPolicy(BasePolicy):
         # Create a copy to avoid mutating input
         obs_copy = observations.copy()
 
+        # Target-alignment context from sim (must not enter VLM/state transforms).
+        self._bon_ctx = {}
+        for k in list(obs_copy.keys()):
+            if str(k).startswith("wm_ctx."):
+                self._bon_ctx[str(k)] = obs_copy.pop(k)
+
         is_batch = self._check_state_is_batched(obs_copy)
         if not is_batch:
             obs_copy = unsqueeze_dict_values(obs_copy)
@@ -345,27 +395,28 @@ class DialPolicy(BasePolicy):
         cands = []
         pred_sf = None
         backbone_feat = None  # cand0 full VLM; cand1..K-1 reuse (skip backbone)
-        for i in range(self.bon_k):
-            torch.manual_seed(seed_base + 10007 * (i + 1))
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed_base + 10007 * (i + 1))
-            copied = _clone(normalized_input)
-            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                model_pred = self.model.get_action(
-                    copied, backbone_features=backbone_feat
-                )
-            a = model_pred["action_pred"].float()
-            if a.ndim == 3:
-                a = a[0]
-            cands.append(a.detach())
-            # pred_sf / backbone are obs-conditioned (independent of action noise).
-            if backbone_feat is None and model_pred.get("backbone_features") is not None:
-                backbone_feat = model_pred["backbone_features"]
-            if pred_sf is None and model_pred.get("pred_state_future") is not None:
-                psf = model_pred["pred_state_future"].detach().float()
-                if psf.ndim == 3:
-                    psf = psf[0]
-                pred_sf = psf
+        with _preserve_torch_rng():
+            for i in range(self.bon_k):
+                torch.manual_seed(seed_base + 10007 * (i + 1))
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed_base + 10007 * (i + 1))
+                copied = _clone(normalized_input)
+                with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+                    model_pred = self.model.get_action(
+                        copied, backbone_features=backbone_feat
+                    )
+                a = model_pred["action_pred"].float()
+                if a.ndim == 3:
+                    a = a[0]
+                cands.append(a.detach())
+                # pred_sf / backbone are obs-conditioned (independent of action noise).
+                if backbone_feat is None and model_pred.get("backbone_features") is not None:
+                    backbone_feat = model_pred["backbone_features"]
+                if pred_sf is None and model_pred.get("pred_state_future") is not None:
+                    psf = model_pred["pred_state_future"].detach().float()
+                    if psf.ndim == 3:
+                        psf = psf[0]
+                    pred_sf = psf
         stacked = torch.stack(cands, dim=0)  # [K,H,D]
 
         scores = None
@@ -374,15 +425,30 @@ class DialPolicy(BasePolicy):
                 raise RuntimeError("bon_select=score requires WM and s_t")
             if pred_sf is None:
                 raise RuntimeError("WM-BoN needs pred_state_future from policy get_action")
-            best, scores = self._wm_bon.select(stacked, s_t, pred_sf)
+            best, scores = self._wm_bon.select(
+                stacked, s_t, pred_sf, ctx=getattr(self, "_bon_ctx", None)
+            )
             tag = "score"
+        elif self.bon_select == "fixed0":
+            # K1 controls: use candidate 0 of the same K-candidate pool.
+            # Scores are computed only for diagnostics when WM is available.
+            best = 0
+            tag = "fixed0"
+            if self._wm_bon is not None and s_t is not None and pred_sf is not None:
+                _, scores = self._wm_bon.select(
+                    stacked, s_t, pred_sf, ctx=getattr(self, "_bon_ctx", None)
+                )
         else:
             # Deterministic among the same K pool (reproducible random arm).
-            rng = np.random.RandomState(seed_base + 17)
+            # RandomState seeds must fit uint32; the per-decision seed grows
+            # past 2**32 after ~43k BoN calls and otherwise kills long eval runs.
+            rng = np.random.RandomState((int(seed_base) + 17) % (2**32))
             best = int(rng.randint(0, self.bon_k))
             tag = "random"
             if self._wm_bon is not None and s_t is not None and pred_sf is not None:
-                _, scores = self._wm_bon.select(stacked, s_t, pred_sf)
+                _, scores = self._wm_bon.select(
+                    stacked, s_t, pred_sf, ctx=getattr(self, "_bon_ctx", None)
+                )
 
         if scores is not None:
             print(
@@ -392,7 +458,92 @@ class DialPolicy(BasePolicy):
             )
         else:
             print(f"[WM-BoN] select={tag} pick={best}/{self.bon_k}", flush=True)
+        self._write_bon_diag(
+            tag=tag,
+            best=best,
+            stacked=stacked,
+            scores=scores,
+            s_t=s_t,
+            pred_sf=pred_sf,
+            seed_base=seed_base,
+            ctx=getattr(self, "_bon_ctx", None),
+        )
         return stacked[best].unsqueeze(0)
+
+    def _write_bon_diag(
+        self,
+        tag: str,
+        best: int,
+        stacked: torch.Tensor,
+        scores: Optional[np.ndarray],
+        s_t: Optional[torch.Tensor],
+        pred_sf: Optional[torch.Tensor],
+        seed_base: int,
+        ctx: Optional[Dict[str, Any]],
+    ) -> None:
+        """Append one BoN decision record when BON_DIAG_LOG is set."""
+        if not self._bon_diag_path:
+            return
+
+        def _jsonable(value):
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            arr = np.asarray(value)
+            if arr.ndim == 0:
+                return arr.item()
+            return arr.tolist()
+
+        ctx = ctx or {}
+        wm = self._wm_bon
+
+        def _pack(value):
+            if value is None:
+                return None
+            arr = np.asarray(value, dtype=np.float16)
+            return {
+                "shape": list(arr.shape),
+                "dtype": "float16",
+                "b64": base64.b64encode(arr.tobytes()).decode("ascii"),
+            }
+
+        action_dim = int(getattr(self._wm_bon, "action_dim", stacked.shape[-1]))
+        actions_norm = stacked.detach().float().cpu().numpy()[:, :, :action_dim]
+        rec = {
+            "encoding": "float16_base64",
+            "tag": tag,
+            "best": int(best),
+            "K": int(self.bon_k),
+            "action_dim": action_dim,
+            "seed_base": int(seed_base),
+            "task": _jsonable(ctx.get("wm_ctx.task_name")),
+            "episode": _jsonable(ctx.get("wm_ctx.episode_id")),
+            "decision": _jsonable(ctx.get("wm_ctx.decision_index")),
+            "scores": None if scores is None else np.asarray(scores).tolist(),
+            "scores_pos": None
+            if wm is None or getattr(wm, "last_scores_pos", None) is None
+            else np.asarray(wm.last_scores_pos).tolist(),
+            "scores_rot": None
+            if wm is None or getattr(wm, "last_scores_rot", None) is None
+            else np.asarray(wm.last_scores_rot).tolist(),
+            "s_t": None
+            if s_t is None
+            else _pack(s_t.detach().float().cpu().numpy().reshape(-1)),
+            "s_hat": None
+            if wm is None or getattr(wm, "last_s_hat", None) is None
+            else _pack(wm.last_s_hat),
+            "pred_sf": None
+            if wm is None or getattr(wm, "last_pred_sf", None) is None
+            else _pack(wm.last_pred_sf),
+            "actions_norm": _pack(actions_norm),
+            "ctx": {k: _jsonable(v) for k, v in ctx.items()},
+        }
+        line = json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
+        if self._bon_diag_path.endswith(".gz"):
+            with gzip.open(self._bon_diag_path, "at", encoding="utf-8") as f:
+                f.write(line + "\n")
+        else:
+            with open(self._bon_diag_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
 
     def propose_bon_with_meta(self, observations: Dict[str, Any]) -> Dict[str, Any]:
         """Sample K BoN candidates and return scores + unnormalized action dicts.
@@ -404,6 +555,10 @@ class DialPolicy(BasePolicy):
             raise RuntimeError("propose_bon_with_meta requires bon_k > 1")
 
         obs_copy = observations.copy()
+        self._bon_ctx = {}
+        for k in list(obs_copy.keys()):
+            if str(k).startswith("wm_ctx."):
+                self._bon_ctx[str(k)] = obs_copy.pop(k)
         is_batch = self._check_state_is_batched(obs_copy)
         if not is_batch:
             obs_copy = unsqueeze_dict_values(obs_copy)
@@ -438,26 +593,27 @@ class DialPolicy(BasePolicy):
         cands = []
         pred_sf = None
         backbone_feat = None  # cand0 full VLM; cand1..K-1 reuse (skip backbone)
-        for i in range(self.bon_k):
-            torch.manual_seed(seed_base + 10007 * (i + 1))
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed_base + 10007 * (i + 1))
-            copied = _clone(normalized_input)
-            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
-                model_pred = self.model.get_action(
-                    copied, backbone_features=backbone_feat
-                )
-            a = model_pred["action_pred"].float()
-            if a.ndim == 3:
-                a = a[0]
-            cands.append(a.detach())
-            if backbone_feat is None and model_pred.get("backbone_features") is not None:
-                backbone_feat = model_pred["backbone_features"]
-            if pred_sf is None and model_pred.get("pred_state_future") is not None:
-                psf = model_pred["pred_state_future"].detach().float()
-                if psf.ndim == 3:
-                    psf = psf[0]
-                pred_sf = psf
+        with _preserve_torch_rng():
+            for i in range(self.bon_k):
+                torch.manual_seed(seed_base + 10007 * (i + 1))
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed_base + 10007 * (i + 1))
+                copied = _clone(normalized_input)
+                with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=COMPUTE_DTYPE):
+                    model_pred = self.model.get_action(
+                        copied, backbone_features=backbone_feat
+                    )
+                a = model_pred["action_pred"].float()
+                if a.ndim == 3:
+                    a = a[0]
+                cands.append(a.detach())
+                if backbone_feat is None and model_pred.get("backbone_features") is not None:
+                    backbone_feat = model_pred["backbone_features"]
+                if pred_sf is None and model_pred.get("pred_state_future") is not None:
+                    psf = model_pred["pred_state_future"].detach().float()
+                    if psf.ndim == 3:
+                        psf = psf[0]
+                    pred_sf = psf
         stacked = torch.stack(cands, dim=0)
 
         scores = None
