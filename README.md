@@ -1,4 +1,4 @@
-# DIAL02-SF: State-Future and World-Model Extensions for DIAL
+# DIAL-SF-WM: State-Future and World-Model Extensions for DIAL
 
 Also referred to as **DIAL-SF-WM**.
 
