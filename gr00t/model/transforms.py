@@ -98,6 +98,35 @@ def build_vlm_processor(vlm_path: str) -> ProcessorMixin:
     return vlm_processor
 
 
+def select_bridge_goal_images(images: np.ndarray, main_view_only: bool) -> np.ndarray:
+    """Pick the future frame used as the bridge-loss target.
+
+    ``images`` is ``[V, T, C, H, W]`` with ``T > 1``. The last time index is the
+    future frame; earlier frames stay on the VLM observation path.
+    ``main_view_only`` keeps view 0 so a dual-camera sample still yields 64
+    bridge tokens instead of 128.
+    """
+    source = images[:1] if main_view_only else images
+    return source[:, -1:]
+
+
+def pad_state_future(state_future: np.ndarray, mask: np.ndarray, pad_dim: int):
+    """Zero-pad a future-state vector on the right. Padded dims stay out of the loss."""
+    width = int(state_future.shape[-1])
+    pad_dim = int(pad_dim)
+    if width > pad_dim:
+        raise ValueError(
+            f"state_future width {width} exceeds pad dim {pad_dim}"
+        )
+    if width == pad_dim:
+        return state_future, mask
+    pad_width = pad_dim - width
+    state_future = np.pad(state_future, ((0, 0), (0, pad_width)))
+    pad_mask = np.zeros((state_future.shape[0], pad_width), dtype=bool)
+    mask = np.concatenate([mask, pad_mask], axis=-1)
+    return state_future, mask
+
+
 def collate(features: List[dict], vlm_processor) -> dict:
     batch = {}
     keys = features[0].keys()
@@ -247,6 +276,13 @@ class GR00TTransform(InvertibleModalityTransform):
     state_future_concat_order: list[str] = Field(default_factory=list)
     # If set, concat width must match exactly (no pad-to-max_state_dim).
     state_future_dim: Optional[int] = None
+    # If set and larger than the concatenated future state, zero-pad to this
+    # width and mark the padded tail invalid. Used to reuse a 128-d SF head
+    # on a narrower embodiment (LIBERO 8-d EEF).
+    state_future_pad_dim: Optional[int] = None
+    # Bridge-loss goal image uses view 0 only. Dual-camera samples otherwise
+    # produce 2 * num_bridge_tokens and the MSE against 64 bridge tokens fails.
+    bridge_goal_main_view_only: bool = False
 
     def model_post_init(self, __context):
         """Called by Pydantic after model init."""
@@ -586,7 +622,9 @@ class GR00TTransformWithGoalImage(GR00TTransform):
             transformed_data[k] = v
 
         if images.shape[1] > 1:
-            goal_images = images[:,-1:]
+            goal_images = select_bridge_goal_images(
+                images, self.bridge_goal_main_view_only
+            )
             transformed_data["goal_images"] = self._apply_goal_image_processing(goal_images)
         else:
             goal_images = None
@@ -681,7 +719,8 @@ class GR00TTransformWithGoalImage(GR00TTransform):
 
         state_future_mask = np.ones_like(state_future, dtype=bool)
 
-        # AND with temporal validity so first_last pad frames are excluded from loss
+        # AND with temporal validity so first_last pad frames are excluded from loss.
+        # Do this before width padding so the padded tail stays invalid.
         time_mask = data.get("state_future_time_mask")
         if time_mask is None:
             raise ValueError(
@@ -695,6 +734,11 @@ class GR00TTransformWithGoalImage(GR00TTransform):
             f"state_future_time_mask length {time_mask.shape[0]} != expected_len {expected_len}"
         )
         state_future_mask &= time_mask[:, None]
+
+        if self.state_future_pad_dim is not None:
+            state_future, state_future_mask = pad_state_future(
+                state_future, state_future_mask, self.state_future_pad_dim
+            )
 
         return state_future, state_future_mask
 
