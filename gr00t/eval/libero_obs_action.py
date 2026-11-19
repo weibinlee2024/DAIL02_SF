@@ -1,3 +1,4 @@
+
 """
 LIBERO online-eval helpers for DIAL (same suites as RND dense collection).
 
@@ -80,11 +81,16 @@ def libero_obs_to_dial(
 
     Expected video shapes without batch: (T,H,W,C) with T=1 when add_time_dim=True.
     """
-    agent = obs.get("agentview_image") or obs.get("agentview_rgb") or obs.get("image")
-    wrist = (
-        obs.get("robot0_eye_in_hand_image")
-        or obs.get("eye_in_hand_rgb")
-        or obs.get("wrist_image")
+    def _pick(keys):
+        for key in keys:
+            value = obs.get(key)
+            if value is not None:
+                return value
+        return None
+
+    agent = _pick(("agentview_image", "agentview_rgb", "image"))
+    wrist = _pick(
+        ("robot0_eye_in_hand_image", "eye_in_hand_rgb", "wrist_image")
     )
     if agent is None or wrist is None:
         raise KeyError(f"Missing cameras in obs keys={list(obs.keys())}")
