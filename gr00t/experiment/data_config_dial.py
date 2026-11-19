@@ -43,14 +43,18 @@ from gr00t.model.backbone.vlm_backbone_dial import DEFAULT_VLM_PATH
 import sys
 import numpy as np
 
-# SF aux-head target (task-relevant Cartesian + hands + fingertips).
+# SF aux-head target (task-relevant Cartesian + hands; optional fingertips).
 # Not used by the action head.
-# 2026-10-11: expanded 30 -> 60 by adding 10 fingertip Cartesian positions.
-#   wrists pos+rot6d (18) + hand joints (12) + 10 tips x 3 (30) = 60.
-# Pre-change 30-d keys backed up in bake20261011_sf_d30/.
-# skip sin-cos so hands stay 6-d each.
-# Override with env SF_FORCE_KEY_DIM=30 for legacy d30 re-runs (w-sweep / MoT aligned).
-_SF_FORCE_KEY_DIM = os.environ.get("SF_FORCE_KEY_DIM", "").strip()
+# Default dim=30: wrists pos+rot6d (18) + hand joints (12). Matches mean_pool+motcond
+# mainline (w=0.05, L12) and WM verifier posrot18.
+# Opt-in dim=60: set SF_FORCE_KEY_DIM=60 to append 10 fingertip Cartesian positions
+#   (10 tips x 3 = +30 → total 60). skip sin-cos so hands stay 6-d each.
+_SF_FORCE_KEY_DIM = os.environ.get("SF_FORCE_KEY_DIM", "30").strip() or "30"
+_STATE_FUTURE_KEYS_ARMS_WAIST = [
+    "state.right_arm",
+    "state.left_arm",
+    "state.waist",
+]
 DEFAULT_STATE_FUTURE_KEYS = [
     "state.wrist_r_pos",
     "state.wrist_r_rot6d",
@@ -59,7 +63,7 @@ DEFAULT_STATE_FUTURE_KEYS = [
     "state.right_hand",
     "state.left_hand",
 ]
-if _SF_FORCE_KEY_DIM != "30":
+if _SF_FORCE_KEY_DIM == "60":
     DEFAULT_STATE_FUTURE_KEYS = DEFAULT_STATE_FUTURE_KEYS + [
         # ten fingertip Cartesian positions (L/R x thumb..pinky)
         "state.thumb_r_pos",
@@ -73,6 +77,8 @@ if _SF_FORCE_KEY_DIM != "30":
         "state.ring_l_pos",
         "state.pinky_l_pos",
     ]
+elif _SF_FORCE_KEY_DIM == "128":
+    DEFAULT_STATE_FUTURE_KEYS = DEFAULT_STATE_FUTURE_KEYS + _STATE_FUTURE_KEYS_ARMS_WAIST
 STATE_FUTURE_KEY_DIMS = {
     "state.wrist_r_pos": 3,
     "state.wrist_r_rot6d": 6,
@@ -90,7 +96,47 @@ STATE_FUTURE_KEY_DIMS = {
     "state.middle_l_pos": 3,
     "state.ring_l_pos": 3,
     "state.pinky_l_pos": 3,
+    "state.right_arm": 7,
+    "state.left_arm": 7,
+    "state.waist": 3,
+    # LIBERO / LIBERO-plus Franka state (8D total)
+    "state.eef_position": 3,
+    "state.eef_rotation": 3,
+    "state.gripper_position": 2,
 }
+
+_STATE_FUTURE_KEYS_D30 = [
+    "state.wrist_r_pos",
+    "state.wrist_r_rot6d",
+    "state.wrist_l_pos",
+    "state.wrist_l_rot6d",
+    "state.right_hand",
+    "state.left_hand",
+]
+_STATE_FUTURE_KEYS_D60_EXTRA = [
+    "state.thumb_r_pos",
+    "state.index_r_pos",
+    "state.middle_r_pos",
+    "state.ring_r_pos",
+    "state.pinky_r_pos",
+    "state.thumb_l_pos",
+    "state.index_l_pos",
+    "state.middle_l_pos",
+    "state.ring_l_pos",
+    "state.pinky_l_pos",
+]
+
+
+def resolve_state_future_keys(dim: int) -> list:
+    """Return the state_future key list for D=30 (pos+rot6d+hand) or D=60 (+fingertips)."""
+    if int(dim) == 30:
+        return list(_STATE_FUTURE_KEYS_D30)
+    if int(dim) == 60:
+        return list(_STATE_FUTURE_KEYS_D30) + list(_STATE_FUTURE_KEYS_D60_EXTRA)
+    if int(dim) == 128:
+        # 47 real dims (30 + arms/waist) padded to 128 by the transform.
+        return list(_STATE_FUTURE_KEYS_D30) + list(_STATE_FUTURE_KEYS_ARMS_WAIST)
+    raise ValueError(f"state_future dim must be 30, 60, or 128, got {dim}")
 
 
 @dataclass
@@ -1279,6 +1325,12 @@ class FourierGr1ArmsWaistAugPosRotFlipDataConfig(FourierGr1ArmsWaistDataConfig):
                     if bool(getattr(self, "use_state_future", False))
                     else None
                 ),
+                state_future_pad_dim=(
+                    int(self.state_future_pad_dim)
+                    if bool(getattr(self, "use_state_future", False))
+                    and getattr(self, "state_future_pad_dim", None) is not None
+                    else None
+                ),
             ),
         ]
         return ComposedModalityTransform(transforms=transforms)
@@ -1360,6 +1412,12 @@ class FourierGr1ArmsWaistAugPosRotFlipCropDataConfig(FourierGr1ArmsWaistAugPosRo
                 state_future_dim=(
                     self.get_state_future_dim()
                     if bool(getattr(self, "use_state_future", False))
+                    else None
+                ),
+                state_future_pad_dim=(
+                    int(self.state_future_pad_dim)
+                    if bool(getattr(self, "use_state_future", False))
+                    and getattr(self, "state_future_pad_dim", None) is not None
                     else None
                 ),
             ),
@@ -1461,6 +1519,187 @@ class FourierGr1ArmsWaistAugPosRotFlipWristOnlyGausNormCropDataConfig(FourierGr1
     action_normalization_modes = {k: "mean_std" for k in action_keys if not k.endswith("rot6d")}
 
 
+class FourierGr1ArmsWaistAugPosRotFlipWristOnlyGausNormCropSf128DataConfig(
+    FourierGr1ArmsWaistAugPosRotFlipWristOnlyGausNormCropDataConfig
+):
+    """GR1 47-D physical future target padded to 128 for the SF head.
+
+    Real supervision dims: 30 (wrist pos+rot6d + hands) + 17 (arms 7+7, waist 3)
+    = 47. The transform zero-pads to 128 and masks the padded tail. The model
+    SF head is created with --state-future-dim 128.
+    """
+
+    state_future_pad_dim = 128
+    state_future_keys = list(_STATE_FUTURE_KEYS_D30) + list(_STATE_FUTURE_KEYS_ARMS_WAIST)
+
+    def _build_state_future_pipeline(self) -> list:
+        """Normalize the SF target only; do not change current-state normalization.
+
+        The parent config uses StateActionSinCosTransform + StateActionTransform
+        for the current state. Adding arms/waist modes to state_normalization_modes
+        would change the observed state distribution, so keep a separate SF-only
+        mode map here.
+        """
+        if not getattr(self, "use_state_future", False):
+            return []
+        src_keys = self.get_state_future_source_keys()
+        sf_keys = [k.replace("state.", "state_future.", 1) for k in src_keys]
+        modes = dict(self.state_normalization_modes)
+        modes.update({k: "mean_std" for k in _STATE_FUTURE_KEYS_ARMS_WAIST})
+        sf_norm = {
+            k.replace("state.", "state_future.", 1): v
+            for k, v in modes.items()
+            if k in src_keys
+        }
+        return [
+            StateActionToTensor(apply_to=sf_keys),
+            StateActionTransform(apply_to=sf_keys, normalization_modes=sf_norm),
+        ]
+
+
+###########################################################################################
+
+
+class LiberoDataConfig(BaseDataConfig):
+    """LIBERO / LIBERO-plus (Franka) data config.
+
+    Layout (matches ``preprocessing/lerobot_dataset_libero.py``):
+      state:  eef_position(3) + eef_rotation(axis-angle 3) + gripper_position(2)
+      action: eef_position_delta(3) + eef_rotation_delta(axis-angle 3) + gripper(1)
+      video:  agentview + wrist
+    The action horizon is kept at 16 so a Robocasa 20k checkpoint
+    (action_horizon=16, max_action_dim=128) loads without recreating the head.
+
+    Video indices stay ``[0]``. ``LeRobotSingleDatasetWithGoalImage.get_video``
+    already appends frame ``t + action_horizon`` (t+16) as the bridge-loss
+    goal, so listing ``[0, 16]`` here would yield three frames and break the
+    dual-camera ``image_type_embedding`` (Embedding size 3: goal + 2 views).
+    The transform feeds the current frame of both cameras to the VLM and only
+    the main-camera goal frame to bridge loss (64 tokens).
+
+    The 36-layer checkpoint's SF head is mean-pool, width 128. LIBERO's
+    future EEF is 8-d (position 3 + axis-angle 3 + gripper 2). Those 8
+    values are zero-padded to 128 and the padded tail is masked out of the
+    SF loss.
+    """
+
+    video_keys = ["video.image", "video.wrist_image"]
+    state_keys = [
+        "state.eef_position",
+        "state.eef_rotation",
+        "state.gripper_position",
+    ]
+    action_keys = [
+        "action.eef_position_delta",
+        "action.eef_rotation_delta",
+        "action.gripper_position",
+    ]
+    language_keys = ["annotation.human.action.task_description"]
+    observation_indices = [0]
+    video_delta_indices = [0]
+    action_indices = list(range(16))
+
+    # Future EEF pose + gripper (8D content). Padded to the checkpoint SF width.
+    state_future_pad_dim = 128
+    state_future_keys = [
+        "state.eef_position",
+        "state.eef_rotation",
+        "state.gripper_position",
+    ]
+
+    state_normalization_modes = {
+        "state.eef_position": "min_max",
+        "state.gripper_position": "min_max",
+    }
+    state_target_rotations = {
+        "state.eef_rotation": "rotation_6d",
+    }
+    action_normalization_modes = {
+        "action.eef_position_delta": "min_max",
+        "action.eef_rotation_delta": "min_max",
+        "action.gripper_position": "min_max",
+    }
+
+    def _build_state_future_pipeline(self) -> list:
+        if not getattr(self, "use_state_future", False):
+            return []
+        src_keys = self.get_state_future_source_keys()
+        sf_keys = [k.replace("state.", "state_future.", 1) for k in src_keys]
+        sf_norm = {
+            k.replace("state.", "state_future.", 1): v
+            for k, v in self.state_normalization_modes.items()
+            if k in src_keys
+        }
+        return [
+            StateActionToTensor(apply_to=sf_keys),
+            StateActionTransform(apply_to=sf_keys, normalization_modes=sf_norm),
+        ]
+
+    def transform(self) -> ModalityTransform:
+        transforms = [
+            VideoToTensor(apply_to=self.video_keys),
+            VideoCrop(apply_to=self.video_keys, scale=0.95),
+            VideoResize(
+                apply_to=self.video_keys,
+                height=224,
+                width=224,
+                interpolation="linear",
+            ),
+            VideoColorJitter(
+                apply_to=self.video_keys,
+                brightness=0.3,
+                contrast=0.4,
+                saturation=0.5,
+                hue=0.08,
+            ),
+            VideoToNumpy(apply_to=self.video_keys),
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes=self.state_normalization_modes,
+                target_rotations=self.state_target_rotations,
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes=self.action_normalization_modes,
+            ),
+            *self._build_state_future_pipeline(),
+            ConcatTransform(
+                video_concat_order=self.video_keys,
+                state_concat_order=self.state_keys,
+                action_concat_order=self.action_keys,
+            ),
+            GR00TTransformWithGoalImage(
+                state_horizon=len(self.observation_indices),
+                action_horizon=len(self.action_indices),
+                max_state_dim=128,
+                max_action_dim=128,
+                vlm_path=self.vlm_path,
+                use_bridge=self.use_bridge,
+                ignore_lang_prefix=self.ignore_lang_prefix,
+                use_state_future=bool(getattr(self, "use_state_future", False)),
+                state_future_horizon=(
+                    self.state_future_horizon
+                    if getattr(self, "state_future_horizon", None) is not None
+                    else len(self.action_indices)
+                ),
+                state_future_concat_order=self.get_state_future_concat_order(),
+                state_future_dim=(
+                    self.get_state_future_dim()
+                    if bool(getattr(self, "use_state_future", False))
+                    else None
+                ),
+                state_future_pad_dim=(
+                    int(self.state_future_pad_dim)
+                    if bool(getattr(self, "use_state_future", False))
+                    else None
+                ),
+                bridge_goal_main_view_only=True,
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
 
 ###########################################################################################
 
@@ -1476,12 +1715,14 @@ DATA_CONFIG_MAP = {
     "unitree_g1": UnitreeG1DataConfig,
     "unitree_g1_full_body": UnitreeG1FullBodyDataConfig,
     "oxe_droid": OxeDroidDataConfig,
+    "libero": LiberoDataConfig,
     "agibot_genie1": AgibotGenie1DataConfig,
     "agibot_genie1_topHead_GausNorm": AgibotGenie1TopHeadGausNormDataConfig,
     "fourier_gr1_arms_waist_aug_pos_rot_flip": FourierGr1ArmsWaistAugPosRotFlipDataConfig,
     "fourier_gr1_arms_waist_aug_pos_rot_flip_crop": FourierGr1ArmsWaistAugPosRotFlipCropDataConfig,
     "fourier_gr1_arms_waist_aug_pos_rot_flip_wrist_only_crop": FourierGr1ArmsWaistAugPosRotFlipWristOnlyCropDataConfig,
     "fourier_gr1_arms_waist_aug_pos_rot_flip_wrist_only_gausNorm_crop": FourierGr1ArmsWaistAugPosRotFlipWristOnlyGausNormCropDataConfig,
+    "fourier_gr1_arms_waist_aug_pos_rot_flip_wrist_only_gausNorm_crop_sf128": FourierGr1ArmsWaistAugPosRotFlipWristOnlyGausNormCropSf128DataConfig,
     "human_egodex_hand_wrist_gr1_only_align_coord_crop": EgoDexHandWristGR1OnlyAlignCoordCropDataConfig,
     "human_egodex_hand_wrist_gr1_only_align_coord_gausNorm_crop": EgoDexHandWristGR1OnlyAlignCoordGausNormCropDataConfig,
 }
